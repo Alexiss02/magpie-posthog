@@ -54,3 +54,11 @@ change pushed bumps it** — a fix `0.1.1`, a new plugin `0.2.0`. It stays `0.x`
 while the plugins are young: a `1.0.0` would claim a stability these have not
 earned. For a plugin installed from git the version is display only; magpie
 tracks the commit to decide what is out of date.
+
+```
+node bump.mjs            # 0.1.0 → 0.1.1, a fix
+node bump.mjs minor      # 0.1.0 → 0.2.0, a new plugin
+node bump.mjs 0.3.0      # an explicit version
+```
+
+`npm run bump` and `npm run bump:minor` are the first two.
