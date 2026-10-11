@@ -133,6 +133,16 @@ assert.equal(u.until, "2026-11-01T00:00:00Z")
 // no credits window when the plan reports none
 assert.deepEqual(I.usageOf({ is_pro: false, ai_credits: { exhausted: false } }).windows, [])
 assert.equal(I.usageOf({ is_pro: false }).plan, "Free")
+// a free plan (code usage not subscribed) shows only the sustained bucket,
+// as Desktop's codeUsageMeter does — burst is dropped
+const free = I.usageOf({
+  is_pro: false,
+  code_usage_subscribed: false,
+  burst: { used_percent: 10, resets_in_seconds: 86400, reset_at: "2026-10-12T00:00:00Z", exceeded: false },
+  sustained: { used_percent: 3, resets_in_seconds: 2592000, reset_at: "2026-11-10T00:00:00Z", exceeded: false },
+})
+assert.deepEqual(free.windows.map((w) => w.name), ["Sustained"])
+assert.equal(free.windows[0].used, 3)
 
 // ---- a refusal keeps the sign-in and says what it means ----------------------
 const refused = await I.explained(new Response(

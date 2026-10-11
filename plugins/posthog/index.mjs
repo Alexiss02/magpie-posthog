@@ -583,8 +583,16 @@ function usageOf(u) {
       ...(Number.isFinite(w.resets_in_seconds) ? { resetSecs: Math.max(0, Math.round(w.resets_in_seconds)) } : {}),
     })
   }
-  limit("Burst", u.burst)
-  limit("Sustained", u.sustained)
+  // PostHog's own meter shows a free plan (code usage not subscribed) as only
+  // its sustained valve bucket — burst is meaningless there, exactly as
+  // Desktop's codeUsageMeter returns { kind:"bucket", bucket: sustained }.
+  // An absent code_usage_subscribed is unknown, not free, so it keeps both.
+  if (u.code_usage_subscribed === false) {
+    limit("Sustained", u.sustained)
+  } else {
+    limit("Burst", u.burst)
+    limit("Sustained", u.sustained)
+  }
   const c = u.ai_credits
   if (c && Number.isFinite(c.limit_usd) && c.limit_usd > 0) {
     const used = Number.isFinite(c.used_usd) ? c.used_usd : 0

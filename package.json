@@ -1,6 +1,6 @@
 {
   "name": "opencode-posthog-auth",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "type": "module",
   "main": "./index.mjs",
   "description": "PostHog Desktop's coding plan (PostHog Code) as a magpie / OpenCode provider plugin",
