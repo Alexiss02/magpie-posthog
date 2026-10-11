@@ -151,7 +151,7 @@ const NAMES = {
   "zai-org/glm-5.3": "GLM-5.3",
   "zai-org/glm-5.3-flash": "GLM-5.3 Flash",
   "moonshotai/kimi-k3": "Kimi K3",
-  "deepseek-ai/deepseek-v4-flash-0731": "DeepSeek V4 Flash",
+  "deepseek-ai/deepseek-v4-flash-0731": "DeepSeek V4 Flash 0731",
 }
 
 // nameOf is the plan's own name for a model, the gateway's when it has a better
