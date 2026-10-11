@@ -1,14 +1,14 @@
 {
-  "name": "magpie-plugins",
-  "version": "1.0.0",
+  "name": "opencode-posthog-auth",
+  "version": "0.1.0",
   "type": "module",
   "main": "./index.mjs",
-  "description": "magpie / OpenCode provider plugins: PostHog Desktop's coding plan and others",
+  "description": "PostHog Desktop's coding plan (PostHog Code) as a magpie / OpenCode provider plugin",
   "license": "MIT",
   "author": "Alexiss02",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Alexiss02/magpie-plugins.git"
+    "url": "git+https://github.com/Alexiss02/magpie-posthog.git"
   },
   "keywords": [
     "opencode-plugin",

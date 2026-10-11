@@ -1,4 +1,4 @@
-# magpie-plugins
+# magpie-posthog
 
 Provider plugins for [magpie](https://github.com/yetone/magpie) (and OpenCode):
 sign in to a subscription or a coding plan, and chat with its models through
@@ -8,7 +8,7 @@ One repository, one install: magpie collects every plugin a package's entry
 module exports, so `plugin add` here adds all of them.
 
 ```
-magpie plugin add github:Alexiss02/magpie-plugins
+magpie plugin add github:Alexiss02/magpie-posthog
 ```
 
 Installed from the repository, magpie keeps it current by itself — it compares
@@ -46,3 +46,11 @@ node plugins/posthog/test-posthog.mjs --live    # also asks the vendor
 ```
 
 `npm test` is the first of the two.
+
+## Versions
+
+`package.json`'s `version` is what magpie shows on the plugin's row, so **every
+change pushed bumps it** — a fix `0.1.1`, a new plugin `0.2.0`. It stays `0.x`
+while the plugins are young: a `1.0.0` would claim a stability these have not
+earned. For a plugin installed from git the version is display only; magpie
+tracks the commit to decide what is out of date.
