@@ -67,6 +67,32 @@ assert.equal(m.api.url, "https://gateway.eu.posthog.com/posthog_code/v1")
 assert.deepEqual(Object.keys(m.variants), ["low", "high"])
 assert.equal(m.capabilities.attachment, true)
 
+// ---- the reasoning depths, which the gateway's list never carries --------------
+// every one of its 30 models answers supported_reasoning_levels: [], so the
+// catalog's are what a model gets
+assert.equal(I.levelsOf("claude-opus-5").join(","), "low,medium,high,xhigh,max,ultracode")
+assert.equal(I.levelsOf("claude-opus-4-5").join(","), "low,medium,high")
+assert.equal(I.levelsOf("claude-sonnet-4-6").join(","), "low,medium,high")
+assert.equal(I.levelsOf("gpt-5.5").join(","), "low,medium,high,xhigh")
+assert.equal(I.levelsOf("gpt-5.6-sol").join(","), "low,medium,high,xhigh,max")
+assert.equal(I.levelsOf("gpt-6.1-sol").join(","), "low,medium,high,xhigh,max")
+// GLM takes two depths, not the ladder
+assert.deepEqual(I.levelsOf("zai-org/glm-5.3-flash"), ["high", "max"])
+assert.deepEqual(I.levelsOf("@cf/zai-org/glm-5.2"), ["high", "max"])
+// Kimi and DeepSeek reason, but expose no depth to pick
+assert.deepEqual(I.levelsOf("moonshotai/kimi-k3"), [])
+assert.deepEqual(I.levelsOf("deepseek-ai/deepseek-v4-flash-0731"), [])
+// a variant the catalog doesn't name: its family's, else every Codex model's
+assert.equal(I.levelsOf("gpt-5.4").join(","), "low,medium,high")
+assert.equal(I.levelsOf("gpt-5.3-codex").join(","), "low,medium,high")
+// an unnamed Claude model yields none: PostHog never gave it a depth to pick
+assert.deepEqual(I.levelsOf("claude-unnamed-9"), [])
+// the gateway's own answer wins when it ever carries one
+assert.equal(I.fromGateway("claude-opus-5", { supported_reasoning_levels: ["low"] }).levels.join(","), "low")
+assert.equal(I.fromGateway("moonshotai/kimi-k3", {}).levels.length, 0)
+assert.equal(I.modelOf({ id: "posthog" }, I.REGIONS.us, I.fromGateway("zai-org/glm-5.3-flash", {})).capabilities.reasoning, true)
+assert.equal(I.modelOf({ id: "posthog" }, I.REGIONS.us, I.fromGateway("moonshotai/kimi-k3", {})).capabilities.reasoning, false)
+
 // ---- the allowance -----------------------------------------------------------
 const u = I.usageOf({
   is_pro: true,
