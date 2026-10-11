@@ -59,9 +59,17 @@ const REGION_PROMPT = {
   validate: (v) => (REGIONS[v] ? "" : "pick us or eu"),
 }
 
-// The Desktop app's registered redirect is the portless
-// http://localhost/callback, so the authorization server accepts any port on
-// it (RFC 8252 §7.3 loopback); the plugin asks for the port it listens on.
+// The callback ports the posthog_code app has actually registered for the
+// loopback redirect — http://localhost:{8237,8239}/callback
+// (products/tasks/backend/management/commands/setup_tasks_oauth.py and the
+// pi-posthog-llm-gateway's REDIRECT_PORTS both name those two). PostHog only
+// port-relaxes a redirect to the portless http://localhost/callback when the
+// app registers that portless form; this app registers specific ports, so a
+// random ephemeral port is stripped to http://localhost/callback, which
+// matches neither registered URI, and the /authorize consent answers
+// "Mismatching redirect URI". The callback must sit on one of the registered
+// ports for the redirect to be accepted.
+const CALLBACK_PORTS = [8237, 8239]
 const redirectFor = (port) => `http://localhost:${port}/callback`
 
 const regionOf = (a) => REGIONS[a?.region] ?? REGIONS[a?.metadata?.region] ?? REGIONS.us
@@ -324,14 +332,27 @@ function fromGateway(id, m) {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 
-// listen binds a loopback port for the callback. No host is given, so the
-// server takes both the ::1 and the 127.0.0.1 a browser may resolve localhost to.
-function listen(port = 0) {
-  return new Promise((resolve, reject) => {
+// listen binds one of the registered callback ports for the sign-in, whose
+// redirect the authorization server then accepts (CALLBACK_PORTS above). No
+// host is given, so the server takes both the ::1 and the 127.0.0.1 a browser
+// may resolve localhost to.
+async function listen() {
+  let lastErr
+  for (const port of CALLBACK_PORTS) {
     const server = createServer()
-    server.once("error", reject)
-    server.listen(port, () => resolve({ server, port: server.address().port }))
-  })
+    try {
+      await new Promise((resolve, reject) => {
+        server.once("error", reject)
+        server.listen(port, resolve)
+      })
+      return { server, port }
+    } catch (err) {
+      lastErr = err
+    }
+  }
+  throw new Error(
+    `no PostHog callback port is free (need one of ${CALLBACK_PORTS.join(", ")}): ${lastErr?.message ?? ""}`,
+  )
 }
 
 const PAGE = (title, body) =>
@@ -390,7 +411,7 @@ const who = (env, region) => {
 
 async function browserSignIn(inputs) {
   const region = REGIONS[inputs?.region] ?? REGIONS.us
-  const { server, port } = await listen(0)
+  const { server, port } = await listen()
   const redirect = redirectFor(port)
   const verifier = randomBytes(32).toString("base64url")
   const challenge = createHash("sha256").update(verifier).digest("base64url")
@@ -756,6 +777,7 @@ export const _internal = {
   usageUrl,
   modelsUrl,
   redirectFor,
+  CALLBACK_PORTS,
   saved,
   who,
   fromGateway,

@@ -27,6 +27,13 @@ assert.equal(config.provider.posthog.models["gpt-5.5"].free, false)
 
 // ---- the redirect the app registered ----------------------------------------
 assert.equal(I.redirectFor(51234), "http://localhost:51234/callback")
+// the posthog_code app registers only http://localhost:{8237,8239}/callback,
+// and PostHog port-relaxes a redirect only when the app registers the portless
+// form — so the callback must sit on one of those two or consent fails with
+// "Mismatching redirect URI" (observed on an ephemeral-port EU login)
+assert.equal(I.redirectFor(8237), "http://localhost:8237/callback")
+assert.equal(I.redirectFor(8239), "http://localhost:8239/callback")
+assert.deepEqual(I.CALLBACK_PORTS, [8237, 8239])
 assert.equal(I.api(I.REGIONS.eu), "https://gateway.eu.posthog.com/posthog_code/v1")
 assert.equal(I.usageUrl(I.REGIONS.us), "https://gateway.us.posthog.com/v1/usage/posthog_code")
 assert.equal(I.SCOPES.includes("llm_gateway:read"), true)
