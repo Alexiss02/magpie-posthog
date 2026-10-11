@@ -93,6 +93,21 @@ assert.equal(I.fromGateway("moonshotai/kimi-k3", {}).levels.length, 0)
 assert.equal(I.modelOf({ id: "posthog" }, I.REGIONS.us, I.fromGateway("zai-org/glm-5.3-flash", {})).capabilities.reasoning, true)
 assert.equal(I.modelOf({ id: "posthog" }, I.REGIONS.us, I.fromGateway("moonshotai/kimi-k3", {})).capabilities.reasoning, false)
 
+// ---- the reply limit, which magpie fills from models.dev when the plugin omits
+// it. models.dev lists DeepSeek V4 Flash's output at 384000, above the 262144
+// its backend takes, so the plugin names the cap itself; every other model is
+// told its window, which is what its backend accepts.
+assert.equal(I.outputOf("deepseek-ai/deepseek-v4-flash-0731", 1048000), 262144)
+assert.equal(I.outputOf("moonshotai/kimi-k3", 262144), 262144)
+assert.equal(I.outputOf("zai-org/glm-5.3-flash", 1000000), 1000000)
+// never more than the window: a reply cannot outgrow the room its prompt left
+assert.equal(I.outputOf("deepseek-ai/deepseek-v4-flash-0731", 200000), 200000)
+assert.equal(I.outputOf("unknown-model", 500000), 500000)
+assert.equal(I.outputOf("unknown-model", 0), 0)
+// and the shape a client reads carries it
+assert.equal(I.modelOf({ id: "posthog" }, I.REGIONS.us, I.fromGateway("deepseek-ai/deepseek-v4-flash-0731", { context_window: 1048000 })).limit.output, 262144)
+assert.equal(I.modelOf({ id: "posthog" }, I.REGIONS.us, I.fromGateway("moonshotai/kimi-k3", { context_window: 262144 })).limit.output, 262144)
+
 // ---- the allowance -----------------------------------------------------------
 const u = I.usageOf({
   is_pro: true,

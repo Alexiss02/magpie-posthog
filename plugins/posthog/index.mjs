@@ -224,6 +224,24 @@ function levelsOf(id) {
   return id.startsWith("gpt-") ? STANDARD : []
 }
 
+// ---- reply limits ------------------------------------------------------------
+
+// The most a reply may hold, where the vendor caps it below the model's window.
+// The gateway's model list carries only a context window, and magpie fills an
+// absent output from models.dev — whose figure for DeepSeek V4 Flash (384000)
+// is above the 262144 its backend takes, so a client told 384000 asks for more
+// than the gateway accepts and every request 400s. The rest take their window,
+// which is what a client asks for when it is told the window alone.
+const OUTPUTS = { "deepseek-ai/deepseek-v4-flash-0731": 262144 }
+
+// outputOf is a model's reply limit as a client is told it: the cap above, its
+// window otherwise, never more than the window (which would size a reply past
+// the room its prompt left).
+const outputOf = (id, context) => {
+  const cap = OUTPUTS[id] ?? context ?? 0
+  return context > 0 && cap > context ? context : cap
+}
+
 const price = (v) => {
   const n = Number(v)
   return Number.isFinite(n) && n >= 0 ? n : 0
@@ -244,7 +262,7 @@ function modelOf(provider, region, m) {
     headers: {},
     options: {},
     cost: { input: m.input, output: m.output, cache: { read: m.read, write: m.write } },
-    limit: { context: m.context, output: 0 },
+    limit: { context: m.context, output: outputOf(m.id, m.context) },
     capabilities: {
       temperature: true,
       reasoning: !!levels.length,
@@ -742,6 +760,7 @@ export const _internal = {
   who,
   fromGateway,
   levelsOf,
+  outputOf,
   modelOf,
   fallbackModels,
   usageOf,
