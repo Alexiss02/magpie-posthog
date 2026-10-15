@@ -22,7 +22,9 @@ import { createServer } from "node:http"
 
 const NPM = "@ai-sdk/openai-compatible"
 const PRODUCT = "posthog_code"
-const SCOPES = "openid profile email llm_gateway:read"
+// billing:read is granted on ask (the app's ceiling allows it): it reads the
+// plan and the coding plan's credit bucket at the cloud's /api/billing/
+const SCOPES = "openid profile email llm_gateway:read billing:read"
 const CALLBACK_TIMEOUT_MS = 5 * 60 * 1000
 const EARLY_MS = 60 * 1000 // a token this close to its end is refreshed before a request
 const LEAD_MS = 5 * 60 * 1000 // and this close, magpie renews it ahead of time (auth.refresh)
@@ -76,6 +78,7 @@ const regionOf = (a) => REGIONS[a?.region] ?? REGIONS[a?.metadata?.region] ?? RE
 const api = (r) => `${r.gateway}/${PRODUCT}/v1`
 const usageUrl = (r) => `${r.gateway}/v1/usage/${PRODUCT}`
 const modelsUrl = (r) => `${r.gateway}/${PRODUCT}/v1/models`
+const billingUrl = (r) => `${r.cloud}/api/billing/`
 
 // ---- the plan's models -------------------------------------------------------
 
@@ -581,9 +584,11 @@ async function signedIn(client, getAuth) {
 // ---- the allowance -----------------------------------------------------------
 
 // usageOf is the plan's allowance as the gateway reports it: its burst and
-// sustained cost limits, each a percent of what it allows, and the AI credits
-// the coding plan spends, as dollars.
-function usageOf(u) {
+// sustained cost limits, each a percent of what it allows, the AI credits
+// the coding plan spends as dollars, and — when the sign-in carries
+// billing:read — the plan's own credit bucket as the cloud's billing reports
+// it (posthog_code_credits: used / limit per billing period).
+function usageOf(u, billing) {
   const out = {
     plan: u.is_pro ? "Pro" : "Free",
     windows: [],
@@ -618,6 +623,23 @@ function usageOf(u) {
       amount: used,
       limit: c.limit_usd,
       unit: "usd",
+    })
+  }
+  // the plan's own credit bucket, as the cloud's billing reports it — the
+  // number PostHog's web console shows, which the gateway's usage endpoint
+  // never carries; a sign-in without billing:read reads none
+  const b = Array.isArray(billing?.products)
+    ? billing.products.find((p) => p?.usage_key === "posthog_code_credits")
+    : null
+  if (b && Number.isFinite(b.usage_limit) && b.usage_limit > 0) {
+    const used = Number.isFinite(b.current_usage) ? b.current_usage : 0
+    out.windows.push({
+      name: "Code credits",
+      used: (100 * used) / b.usage_limit,
+      display: `${used} / ${b.usage_limit} credits`,
+      amount: used,
+      limit: b.usage_limit,
+      unit: "credits",
     })
   }
   return out
@@ -775,7 +797,17 @@ export const PostHogAuthPlugin = async ({ client }) => ({
           } catch {}
           return { error: `${why} (HTTP ${res.status})`, signIn: "kept" }
         }
-        return { ...usageOf(await res.json()), signIn: "kept" }
+        // the cloud's billing, for the credit bucket the gateway's usage
+        // never carries; a sign-in without billing:read is simply without it
+        let billing = null
+        try {
+          const b = await fetch(billingUrl(s.region), {
+            headers: { Authorization: `Bearer ${s.bearer}`, Accept: "application/json" },
+            signal: AbortSignal.timeout(15000),
+          })
+          if (b.ok) billing = await b.json().catch(() => null)
+        } catch {}
+        return { ...usageOf(await res.json(), billing), signIn: "kept" }
       } catch (e) {
         return { error: e?.message ?? String(e), signIn: "kept" }
       }
@@ -806,6 +838,7 @@ export const _internal = {
   api,
   usageUrl,
   modelsUrl,
+  billingUrl,
   redirectFor,
   CALLBACK_PORTS,
   saved,

@@ -42,6 +42,8 @@ assert.deepEqual(I.CALLBACK_PORTS, [8237, 8239])
 assert.equal(I.api(I.REGIONS.eu), "https://gateway.eu.posthog.com/posthog_code/v1")
 assert.equal(I.usageUrl(I.REGIONS.us), "https://gateway.us.posthog.com/v1/usage/posthog_code")
 assert.equal(I.SCOPES.includes("llm_gateway:read"), true)
+assert.equal(I.SCOPES.includes("billing:read"), true)
+assert.equal(I.billingUrl(I.REGIONS.us), "https://us.posthog.com/api/billing/")
 
 // ---- a token response as the account keeps it --------------------------------
 const env = {
@@ -154,6 +156,17 @@ const free = I.usageOf({
 })
 assert.deepEqual(free.windows.map((w) => w.name), ["Sustained"])
 assert.equal(free.windows[0].used, 3)
+// the credit bucket, as the cloud's billing reports it: the gateway's usage
+// never carries it, so it comes from billing:read — and without one, none
+const bucket = I.usageOf(
+  { is_pro: false, code_usage_subscribed: false, sustained: { used_percent: 0, resets_in_seconds: 2592000, reset_at: "2026-11-13T00:00:00Z", exceeded: false } },
+  { products: [{ usage_key: "posthog_code_credits", current_usage: 2445, usage_limit: 2000, percentage_usage: 1.2225 }] },
+)
+assert.deepEqual(bucket.windows.map((w) => w.name), ["Sustained", "Code credits"])
+assert.equal(bucket.windows[1].used, 122.25)
+assert.equal(bucket.windows[1].display, "2445 / 2000 credits")
+assert.equal(bucket.windows[1].unit, "credits")
+assert.deepEqual(I.usageOf({ is_pro: false }, { products: [] }).windows, [])
 
 // ---- a refusal keeps the sign-in and says what it means ----------------------
 const refused = await I.explained(new Response(
@@ -224,6 +237,15 @@ try {
   const paid = await hooks.provider.models({ id: "posthog" }, { auth: signed })
   assert.equal(paid["claude-opus-5"].free, false)
   assert.equal(paid["zai-org/glm-5.3-flash"].free, true)
+  // usage reads the gateway's buckets and, with billing:read, the credit bucket
+  globalThis.fetch = async (url) =>
+    String(url).includes("/api/billing/")
+      ? new Response(JSON.stringify({ products: [{ usage_key: "posthog_code_credits", current_usage: 66, usage_limit: 2000, percentage_usage: 0.033 }] }), { status: 200, headers: { "content-type": "application/json" } })
+      : new Response(JSON.stringify({ product: "posthog_code", is_pro: false, code_usage_subscribed: false, burst: { used_percent: 0, resets_in_seconds: 86400, reset_at: "2026-10-16T00:00:00Z", exceeded: false }, sustained: { used_percent: 1, resets_in_seconds: 2592000, reset_at: "2026-11-13T00:00:00Z", exceeded: false }, ai_credits: { exhausted: false, used_usd: null, limit_usd: null }, billing_period_end: "2026-11-13T05:58:42Z" }), { status: 200, headers: { "content-type": "application/json" } })
+  const usage = await hooks.auth.usage(async () => signed)
+  assert.equal(usage.plan, "Free")
+  assert.deepEqual(usage.windows.map((w) => w.name), ["Sustained", "Code credits"])
+  assert.equal(usage.windows[1].display, "66 / 2000 credits")
 } finally {
   globalThis.fetch = realFetch
 }
