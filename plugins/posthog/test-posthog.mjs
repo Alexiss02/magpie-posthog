@@ -14,7 +14,7 @@ await hooks.config(config)
 assert.equal(config.provider.posthog.name, "PostHog")
 assert.equal(config.provider.posthog.npm, "@ai-sdk/openai-compatible")
 assert.equal(config.provider.posthog.api, "https://gateway.us.posthog.com/posthog_code/v1")
-assert.equal(Object.keys(config.provider.posthog.models).length, 30)
+assert.equal(Object.keys(config.provider.posthog.models).length, 23)
 assert.equal(config.provider.posthog.models["claude-sonnet-5"].limit.context, 1000000)
 // the four the gateway serves without a paid plan, and no others
 assert.equal(config.provider.posthog.models["@cf/zai-org/glm-5.2"].name, "GLM-5.2")
@@ -24,6 +24,11 @@ assert.equal(config.provider.posthog.models["moonshotai/kimi-k3"].free, true)
 assert.equal(config.provider.posthog.models["zai-org/glm-5.3-flash"].free, true)
 assert.equal(config.provider.posthog.models["claude-opus-5"].free, false)
 assert.equal(config.provider.posthog.models["gpt-5.5"].free, false)
+// the models PostHog's own app blocks never list, signed out or in
+assert.equal(config.provider.posthog.models["gpt-5-mini"], undefined)
+assert.equal(config.provider.posthog.models["gpt-5.2"], undefined)
+assert.equal(config.provider.posthog.models["claude-opus-4-6"], undefined)
+assert.equal(config.provider.posthog.models["claude-haiku-4-5"], undefined)
 
 // ---- the redirect the app registered ----------------------------------------
 assert.equal(I.redirectFor(51234), "http://localhost:51234/callback")
@@ -73,6 +78,12 @@ assert.equal(m.cost.cache.read, 0.0000005)
 assert.equal(m.api.url, "https://gateway.eu.posthog.com/posthog_code/v1")
 assert.deepEqual(Object.keys(m.variants), ["low", "high"])
 assert.equal(m.capabilities.attachment, true)
+// the org's own marks, as Desktop reads them: refused models say why, an
+// absent mark is allowed
+const gated = I.fromGateway("claude-opus-5", { allowed: false, restriction_reason: "paid_plan_required" })
+assert.equal(gated.allowed, false)
+assert.equal(gated.reason, "paid_plan_required")
+assert.equal(I.fromGateway("zai-org/glm-5.3-flash", {}).allowed, true)
 
 // ---- the reasoning depths, which the gateway's list never carries --------------
 // every one of its 30 models answers supported_reasoning_levels: [], so the
@@ -183,17 +194,45 @@ assert.equal(await I.signedIn(client, async () => ({ type: "oauth", refresh: "ph
 
 // ---- the hooks, without a sign-in --------------------------------------------
 const models = await hooks.provider.models({ id: "posthog" }, { auth: undefined })
-assert.equal(Object.keys(models).length, 30)
+assert.equal(Object.keys(models).length, 23)
 const anon = await hooks.auth.usage(async () => undefined)
 assert.equal(anon.error, "not signed in")
 assert.equal(hooks.auth.loader(async () => undefined) instanceof Promise, true)
 assert.equal(await hooks.auth.loader(async () => undefined).then((o) => o.baseURL), undefined)
 
+// ---- the hooks, with a sign-in: the gateway's per-org marks -------------------
+// an org some model is refused for is served exactly what it is allowed as
+// free; one everything is allowed for keeps the plan's own free set
+const realFetch = globalThis.fetch
+const entry = (id, allowed) => ({
+  id,
+  allowed,
+  restriction_reason: allowed ? null : "paid_plan_required",
+  context_window: 1000000,
+  supports_vision: false,
+  pricing: { prompt: "0.000001", completion: "0.000002" },
+})
+const withList = (ms) => async () =>
+  new Response(JSON.stringify({ data: ms }), { status: 200, headers: { "content-type": "application/json" } })
+const signed = { type: "api", key: "pha_z", region: "us" }
+try {
+  globalThis.fetch = withList([entry("claude-opus-5", false), entry("zai-org/glm-5.3-flash", true)])
+  const restricted = await hooks.provider.models({ id: "posthog" }, { auth: signed })
+  assert.equal(restricted["claude-opus-5"].free, false)
+  assert.equal(restricted["zai-org/glm-5.3-flash"].free, true)
+  globalThis.fetch = withList([entry("claude-opus-5", true), entry("zai-org/glm-5.3-flash", true)])
+  const paid = await hooks.provider.models({ id: "posthog" }, { auth: signed })
+  assert.equal(paid["claude-opus-5"].free, false)
+  assert.equal(paid["zai-org/glm-5.3-flash"].free, true)
+} finally {
+  globalThis.fetch = realFetch
+}
+
 // ---- the hooks, live ---------------------------------------------------------
 if (process.argv.includes("--live")) {
   const auth = { type: "oauth", access: "pha_expired", refresh: "", region: "us", expires: Date.now() + 3600e3 }
   const live = await hooks.provider.models({ id: "posthog" }, { auth })
-  assert.equal(Object.keys(live).length, 30, "the gateway's own list")
+  assert.equal(Object.keys(live).length, 23, "the gateway's own list")
   assert.ok(live["claude-opus-5"], "claude-opus-5 is in the plan")
   assert.equal(live["claude-opus-5"].name, "Claude Opus 5", "the plan's own name")
   assert.equal(live["zai-org/glm-5.3-flash"].name, "GLM-5.3 Flash")

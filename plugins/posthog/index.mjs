@@ -83,22 +83,15 @@ const modelsUrl = (r) => `${r.gateway}/${PRODUCT}/v1/models`
 // the gateway won't give: [id, context, vision, reasoning levels, prompt,
 // completion, cache read, cache write], prices per token.
 const FALLBACK = [
-  ["claude-haiku-4-5", 200000, true, "0.000001", "0.000005", "0.0000001", "0.00000125"],
-  ["claude-sonnet-4-5", 200000, true, "0.000003", "0.000015", "0.0000003", "0.00000375"],
   ["claude-sonnet-4-6", 1000000, true, "0.000003", "0.000015", "0.0000003", "0.00000375"],
   ["claude-sonnet-5", 1000000, true, "0.000002", "0.00001", "0.0000002", "0.0000025"],
   ["claude-sonnet-5-5", 1000000, true, "0.000002", "0.00001", "0.0000002", "0.0000025"],
-  ["claude-opus-4-5", 200000, true, "0.000005", "0.000025", "0.0000005", "0.00000625"],
-  ["claude-opus-4-6", 1000000, true, "0.000005", "0.000025", "0.0000005", "0.00000625"],
   ["claude-opus-4-7", 1000000, true, "0.000005", "0.000025", "0.0000005", "0.00000625"],
   ["claude-opus-4-8", 1000000, true, "0.000005", "0.000025", "0.0000005", "0.00000625"],
   ["claude-opus-5", 1000000, true, "0.000005", "0.000025", "0.0000005", "0.00000625"],
   ["claude-opus-5-5", 1000000, true, "0.000004", "0.00002", "0.0000004", "0.000005"],
   ["claude-fable-5", 1000000, true, "0.00001", "0.00005", "0.000001", "0.0000125"],
   ["claude-fable-5-1", 1000000, true, "0.00001", "0.00005", "0.000001", "0.0000125"],
-  ["gpt-5-mini", 272000, true, "0.00000025", "0.000002", "0.000000025", "0.00000025"],
-  ["gpt-5.2", 272000, true, "0.00000175", "0.000014", "0.000000175", "0.00000175"],
-  ["gpt-5.3-codex", 272000, true, "0.00000175", "0.000014", "0.000000175", "0.00000175"],
   ["gpt-5.4", 1050000, true, "0.0000025", "0.000015", "0.00000025", "0.0000025"],
   ["gpt-5.5", 1050000, true, "0.000005", "0.00003", "0.0000005", "0.000005"],
   ["gpt-5.6-luna", 922000, true, "0.0000002", "0.0000012", "0.00000002", "0.0000002"],
@@ -116,8 +109,9 @@ const FALLBACK = [
 ]
 
 // What the plan serves without a paid subscription (the gateway's
-// posthog_code_free_tier_models); every other model answers 403
-// paid_plan_required until the org has a plan.
+// posthog_code_free_tier_models): the free marks a signed-out list carries,
+// and an org the gateway allows everything keeps. Signed in, the gateway's
+// own per-org marks are what count (allowed/restriction_reason, below).
 const FREE_TIER = new Set([
   "@cf/zai-org/glm-5.2",
   "deepseek-ai/deepseek-v4-flash-0731",
@@ -126,26 +120,41 @@ const FREE_TIER = new Set([
 ])
 const FREE_TIER_LIST = [...FREE_TIER].join(", ")
 
+// The models PostHog's own app never lists, whatever the gateway still serves
+// (Desktop's BLOCKED_GATEWAY_MODEL_IDS): older models it keeps out of its
+// picker, with and without their vendor prefixes.
+const BLOCKED = new Set([
+  "gpt-5-mini",
+  "openai/gpt-5-mini",
+  "gpt-5.2",
+  "openai/gpt-5.2",
+  "gpt-5.3",
+  "openai/gpt-5.3",
+  "gpt-5.3-codex",
+  "openai/gpt-5.3-codex",
+  "claude-opus-4-5",
+  "anthropic/claude-opus-4-5",
+  "claude-opus-4-6",
+  "anthropic/claude-opus-4-6",
+  "claude-sonnet-4-5",
+  "anthropic/claude-sonnet-4-5",
+  "claude-haiku-4-5",
+  "anthropic/claude-haiku-4-5",
+])
+
 // What PostHog's own picker calls each model (its model catalog, resolved to a
 // label); the gateway's display_name is the raw id, which reads badly beside
 // the FREE badge and the plan's other rows.
 const NAMES = {
-  "claude-haiku-4-5": "Claude Haiku 4.5",
-  "claude-sonnet-4-5": "Claude Sonnet 4.5",
   "claude-sonnet-4-6": "Claude Sonnet 4.6",
   "claude-sonnet-5": "Claude Sonnet 5",
   "claude-sonnet-5-5": "Claude Sonnet 5.5",
-  "claude-opus-4-5": "Claude Opus 4.5",
-  "claude-opus-4-6": "Claude Opus 4.6",
   "claude-opus-4-7": "Claude Opus 4.7",
   "claude-opus-4-8": "Claude Opus 4.8",
   "claude-opus-5": "Claude Opus 5",
   "claude-opus-5-5": "Claude Opus 5.5",
   "claude-fable-5": "Claude Fable 5",
   "claude-fable-5-1": "Claude Fable 5.1",
-  "gpt-5-mini": "GPT-5 Mini",
-  "gpt-5.2": "GPT-5.2",
-  "gpt-5.3-codex": "GPT-5.3 Codex",
   "gpt-5.4": "GPT-5.4",
   "gpt-5.5": "GPT-5.5",
   "gpt-5.6-luna": "GPT-5.6 Luna",
@@ -282,8 +291,10 @@ function modelOf(provider, region, m) {
     },
     release_date: "",
     variants: variants(levels),
-    // magpie's own: served at no cost to the plan's credits
-    free: FREE_TIER.has(m.id),
+    // magpie's own: served at no cost to the plan's credits — the org's own
+    // mark when the gateway gave one (models(), below), the plan's free set
+    // otherwise
+    free: m.free ?? FREE_TIER.has(m.id),
     rate: 0,
   }
 }
@@ -325,6 +336,10 @@ function fromGateway(id, m) {
     output: price(m.pricing?.completion),
     read: price(m.pricing?.input_cache_read),
     write: price(m.pricing?.input_cache_write),
+    // the org's own marks, as Desktop reads them: what this account may use,
+    // and why not, when the gateway says no
+    allowed: m.allowed !== false,
+    reason: m.restriction_reason ?? null,
   }
 }
 
@@ -684,9 +699,16 @@ export const PostHogAuthPlugin = async ({ client }) => ({
         const list = Array.isArray(env) ? env : env?.data ?? env?.models ?? []
         const ms = list
           .filter((m) => m?.id && m.visibility !== "hidden" && m.supported_in_api !== false)
+          .filter((m) => !BLOCKED.has(String(m.id).toLowerCase()))
           .map((m) => fromGateway(m.id, m))
         if (!ms.length) return own(provider, s.region)
-        return Object.fromEntries(ms.map((m) => [m.id, modelOf(provider, s.region, m)]))
+        // the marks are per org, and identity-scoped: an org some model is
+        // refused for is served exactly what it is allowed as free; one
+        // everything is allowed for keeps the plan's own free set
+        const restricted = ms.some((m) => !m.allowed)
+        return Object.fromEntries(
+          ms.map((m) => [m.id, modelOf(provider, s.region, restricted ? { ...m, free: m.allowed } : m)]),
+        )
       } catch {
         return own(provider, s.region)
       }
