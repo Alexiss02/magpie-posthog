@@ -229,8 +229,14 @@ const nameOf = (id, given) => NAMES[id] ?? (given && given !== id ? given : id)
 // 'low', 'medium', 'high', 'xhigh', 'max' or 'none'"), and Desktop's catalog
 // gives each model its ladder. `ultracode` is Desktop's own top rung and is not
 // a gateway value, so it is left off every ladder here.
+//
+// The ladders below were read off the gateway itself, not copied from
+// Desktop's catalog: it offers `max` to every GPT model and no GPT model takes
+// it ("Unsupported value: 'reasoning_effort' does not support 'max'"), so a
+// pick there was a 400.
 const STANDARD = ["low", "medium", "high"]
 const THROUGH_MAX = [...STANDARD, "xhigh", "max"]
+const THROUGH_XHIGH = [...STANDARD, "xhigh"]
 const GLM = ["high", "max"]
 
 const EFFORTS = {
@@ -242,18 +248,21 @@ const EFFORTS = {
   "claude-opus-5-5": THROUGH_MAX,
   "claude-fable-5": THROUGH_MAX,
   "claude-fable-5-1": THROUGH_MAX,
-  "claude-sonnet-4-6": STANDARD,
+  "claude-sonnet-4-6": [...STANDARD, "max"], // no xhigh
   "claude-sonnet-5": THROUGH_MAX,
   "claude-sonnet-5-5": THROUGH_MAX,
-  "gpt-5": STANDARD,
-  "gpt-5.5": [...STANDARD, "xhigh"],
-  "gpt-5.6-sol": THROUGH_MAX,
-  "gpt-5.6-terra": THROUGH_MAX,
-  "gpt-5.6-luna": THROUGH_MAX,
-  "gpt-6-astra": THROUGH_MAX,
-  "gpt-6-sol": THROUGH_MAX,
-  "gpt-6.1-sol": THROUGH_MAX,
-  "gpt-6-luna": THROUGH_MAX,
+  "gpt-5": ["minimal", ...STANDARD],
+  "gpt-5-mini": ["minimal", ...STANDARD],
+  "gpt-5.2": THROUGH_XHIGH,
+  "gpt-5.4": THROUGH_XHIGH,
+  "gpt-5.5": THROUGH_XHIGH,
+  "gpt-5.6-sol": THROUGH_XHIGH,
+  "gpt-5.6-terra": THROUGH_XHIGH,
+  "gpt-5.6-luna": THROUGH_XHIGH,
+  "gpt-6-astra": THROUGH_XHIGH,
+  "gpt-6-sol": THROUGH_XHIGH,
+  "gpt-6-luna": THROUGH_XHIGH,
+  "gpt-6.1-sol": THROUGH_XHIGH,
   "zai-org/glm-5.2": GLM,
   "@cf/zai-org/glm-5.2": GLM,
   "zai-org/glm-5.3": GLM,
@@ -264,14 +273,16 @@ const EFFORTS = {
 }
 
 // A whole family's depths, for a variant the gateway lists and the catalog
-// doesn't (gpt-5.4, gpt-5.3-codex): the longest matching prefix wins.
+// doesn't (gpt-5.3-codex): the longest matching prefix wins.
 const FAMILY_EFFORTS = [
-  ["gpt-6-astra", THROUGH_MAX],
-  ["gpt-6-sol", THROUGH_MAX],
-  ["gpt-6.1-sol", THROUGH_MAX],
-  ["gpt-6-luna", THROUGH_MAX],
-  ["gpt-5.6", THROUGH_MAX],
-  ["gpt-5.5", [...STANDARD, "xhigh"]],
+  ["gpt-6-astra", THROUGH_XHIGH],
+  ["gpt-6-sol", THROUGH_XHIGH],
+  ["gpt-6.1-sol", THROUGH_XHIGH],
+  ["gpt-6-luna", THROUGH_XHIGH],
+  ["gpt-5.6", THROUGH_XHIGH],
+  ["gpt-5.5", THROUGH_XHIGH],
+  ["gpt-5.4", THROUGH_XHIGH],
+  ["gpt-5.2", THROUGH_XHIGH],
 ]
 
 // levelsOf is the depths a model takes: its own, its family's, the ones every
@@ -827,6 +838,61 @@ const HINTS = [
   ],
 ]
 
+// ---- parameters the gateway's models refuse ----------------------------------
+
+// The most refusals one request is mended through. Each pass takes one
+// parameter out, and a body has a handful the GPT models reject.
+const REPAIRS = 4
+
+// The parameters an OpenAI-served model refuses, and what to do about each:
+// `max_tokens` becomes the field those models take, the rest come out. A
+// refusal names its parameter in `error.param`, and a temperature names the one
+// value it does take in the message, so the mended body keeps that value rather
+// than losing the field.
+const TAKEN_OUT = ["top_p", "presence_penalty", "frequency_penalty", "logprobs", "top_logprobs", "stop", "parallel_tool_calls"]
+
+// repair is the body with the parameter the refusal names taken out, or null
+// when the refusal isn't one it can mend (a real error is left to be shown).
+function repair(body, why) {
+  if (typeof body !== "string") return null
+  let v
+  try {
+    v = JSON.parse(body)
+  } catch {
+    return null
+  }
+  let param = ""
+  let message = ""
+  try {
+    const e = JSON.parse(why)?.error
+    param = typeof e?.param === "string" ? e.param : ""
+    message = typeof e?.message === "string" ? e.message : ""
+  } catch {}
+  if (!param && !message) return null
+  if (param === "max_tokens" && "max_tokens" in v) {
+    // the models that refuse max_tokens take its value as max_completion_tokens
+    if (!("max_completion_tokens" in v)) v.max_completion_tokens = v.max_tokens
+    delete v.max_tokens
+  } else if (param && param in v && (TAKEN_OUT.includes(param) || param === "temperature")) {
+    if (param === "temperature") {
+      // "does not support 0.7 with this model. Only the default (1) value is
+      // supported": the one value it takes is in the message
+      const only = /only the default \(([\d.]+)\)/i.exec(message)
+      if (only) v.temperature = Number(only[1])
+      else delete v.temperature
+    } else {
+      delete v[param]
+    }
+  } else if (!param && /reasoning_effort/i.test(message)) {
+    // an effort the model has no rung for: left to the caller, who is offered
+    // the ladder (levelsOf), not mended into another depth behind its back
+    return null
+  } else {
+    return null
+  }
+  return JSON.stringify(v)
+}
+
 // explained is a refused answer with the hint for it, if any, and the sign-in
 // kept unless the gateway refused the credential itself.
 async function explained(res) {
@@ -955,6 +1021,17 @@ export const PostHogAuthPlugin = async ({ client }) => ({
           const req = input instanceof Request ? input : null
           let body = init?.body
           if (body === undefined && req) body = await req.clone().text()
+          // The gateway serves the GPT models on OpenAI's terms: they refuse
+          // `max_tokens`, and a temperature other than their one default, and
+          // some refuse sampling altogether. The client speaks the shape it was
+          // told (chat completions), so the plugin takes those back out of the
+          // body before it goes: once per refusal the gateway names.
+          const mend = (why) => {
+            const next = repair(body, why)
+            if (next === null) return false
+            body = next
+            return true
+          }
           const send = async (token, host) => {
             const headers = new Headers(init?.headers ?? req?.headers)
             headers.delete("authorization")
@@ -964,6 +1041,7 @@ export const PostHogAuthPlugin = async ({ client }) => ({
             headers.set("Authorization", `Bearer ${token}`)
             headers.set("x-api-key", token)
             headers.set("Accept", headers.get("Accept") ?? "application/json")
+            if (typeof body === "string" && body !== init?.body) headers.delete("content-length")
             const url = new URL(req ? req.url : String(input))
             // the gateway the token was minted for: the request keeps its path
             // (/v1/chat/completions, /v1/messages), at that host
@@ -991,6 +1069,17 @@ export const PostHogAuthPlugin = async ({ client }) => ({
             } catch (e) {
               throw Object.assign(new Error(explainedMint(e)), { signIn: e?.signIn ?? "kept" })
             }
+          }
+          // a parameter the model refuses: take it out and ask again. Bounded,
+          // and only for a body the gateway itself named a parameter in, so a
+          // real refusal is never sent twice
+          for (let tries = 0; res.status === 400 && tries < REPAIRS; tries++) {
+            const why = await res.text()
+            if (!mend(why)) {
+              res = new Response(why, { status: res.status, statusText: res.statusText, headers: res.headers })
+              break
+            }
+            res = await send(gw.token, gw.gateway)
           }
           return res.status >= 400 ? explained(res) : kept(res)
         },
@@ -1044,6 +1133,8 @@ export const PostHogAuthPlugin = async ({ client }) => ({
 
 // for tests
 export const _internal = {
+  REPAIRS,
+  repair,
   REGIONS,
   SCOPES,
   PRODUCT_MODELS,

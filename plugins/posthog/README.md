@@ -84,10 +84,31 @@ filter picks them. Every other model stays listed with `free` off: asking for on
 answers 403 `model_not_allowed`, which the card explains, naming what the free tier does serve.
 
 **Reasoning levels.** The gateway takes `minimal`, `low`, `medium`, `high`, `xhigh`, `max` and
-`none` — anything else is a 400. Desktop's catalog gives each model its ladder, and the plugin
-publishes those (minus `ultracode`, which is Desktop's own top rung and not a gateway value):
-Opus 5 / Sonnet 5 / Fable up to `max`, Sonnet 4.6 and Opus 4.5 the standard three, GPT-5.5 up to
-`xhigh`, the GLM family two depths (`high`, `max`), and Kimi and DeepSeek none at all.
+`none` — anything else is a 400. The plugin publishes the ladder each model actually takes, read
+off the gateway rather than copied from Desktop's catalog:
+
+| Model | Ladder |
+|---|---|
+| Opus 4.6 and up, Fable 5 / 5.1, Sonnet 5 / 5.5 | `low` `medium` `high` `xhigh` `max` |
+| Sonnet 4.6 | `low` `medium` `high` `max` (no `xhigh`) |
+| Opus 4.5, GPT-5, GPT-5 mini | `low` `medium` `high` (GPT-5 also `minimal`) |
+| GPT-5.2 and up, every GPT-6 | `low` `medium` `high` `xhigh` |
+| GLM family | `high` `max` |
+| Kimi K3, DeepSeek V4 Flash, DeepSeek V4.1 Flash Fast | none — no effort control |
+
+Desktop's catalog offers `max` to every GPT model; the gateway answers `Unsupported value:
+'reasoning_effort' does not support 'max'` for all of them, so it is on no GPT ladder here.
+`ultracode` is Desktop's own top rung and not a gateway value, so it is on none either.
+
+**Parameters the GPT models refuse.** The gateway serves the GPT models on OpenAI's terms: they
+reject `max_tokens` (`Use 'max_completion_tokens' instead`), a `temperature` other than their one
+default, and `top_p`, `presence_penalty`, `frequency_penalty`, `stop`, `logprobs` and
+`parallel_tool_calls` outright. A client that speaks chat completions sends `max_tokens` and often a
+temperature, so the plugin mends the body when the gateway names the parameter — `max_tokens`
+becomes `max_completion_tokens` at the same value, a temperature takes the one value the message
+names, and the rest come out — and asks again, at most four times. A refusal that names no
+mendable parameter is shown as it came; a `reasoning_effort` refusal is never mended into another
+depth behind the caller's back.
 
 **Reply limits.** The context window is what a prompt and its reply share. Kimi's backend rejects
 a sum over its window, so its reply is capped at half of it (524288); every other model takes its

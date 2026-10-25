@@ -122,13 +122,16 @@ assert.equal(I.npmOf("zai-org/glm-5.2", []), "@ai-sdk/openai-compatible")
 // ---- the reasoning depths, which the gateway's list never carries --------------
 // every one of its models answers supported_reasoning_levels: [], so the
 // catalog's are what a model gets — and only the depths the gateway accepts
-// (ultracode is Desktop's own rung and a 400 here, so it is on no ladder)
+// (ultracode is Desktop's own rung and a 400 here, so it is on no ladder; `max`
+// is on no GPT model's, which the gateway answers "does not support 'max'")
 assert.equal(I.levelsOf("claude-opus-5").join(","), "low,medium,high,xhigh,max")
 assert.equal(I.levelsOf("claude-opus-4-5").join(","), "low,medium,high")
-assert.equal(I.levelsOf("claude-sonnet-4-6").join(","), "low,medium,high")
+// Sonnet 4.6 takes max but not xhigh
+assert.equal(I.levelsOf("claude-sonnet-4-6").join(","), "low,medium,high,max")
+assert.equal(I.levelsOf("gpt-5").join(","), "minimal,low,medium,high")
 assert.equal(I.levelsOf("gpt-5.5").join(","), "low,medium,high,xhigh")
-assert.equal(I.levelsOf("gpt-5.6-sol").join(","), "low,medium,high,xhigh,max")
-assert.equal(I.levelsOf("gpt-6.1-sol").join(","), "low,medium,high,xhigh,max")
+assert.equal(I.levelsOf("gpt-5.6-sol").join(","), "low,medium,high,xhigh")
+assert.equal(I.levelsOf("gpt-6.1-sol").join(","), "low,medium,high,xhigh")
 // GLM takes two depths, not the ladder
 assert.deepEqual(I.levelsOf("zai-org/glm-5.3-flash"), ["high", "max"])
 assert.deepEqual(I.levelsOf("zai-org/glm-5.2"), ["high", "max"])
@@ -136,7 +139,7 @@ assert.deepEqual(I.levelsOf("zai-org/glm-5.2"), ["high", "max"])
 assert.deepEqual(I.levelsOf("moonshotai/kimi-k3"), [])
 assert.deepEqual(I.levelsOf("deepseek-ai/deepseek-v4-flash-0731"), [])
 // a variant the catalog doesn't name: its family's, else every Codex model's
-assert.equal(I.levelsOf("gpt-5.4").join(","), "low,medium,high")
+assert.equal(I.levelsOf("gpt-5.4").join(","), "low,medium,high,xhigh")
 assert.equal(I.levelsOf("gpt-5.3-codex").join(","), "low,medium,high")
 // an unnamed Claude model yields none: PostHog never gave it a depth to pick
 assert.deepEqual(I.levelsOf("claude-unnamed-9"), [])
@@ -153,6 +156,43 @@ assert.equal(I.outputOf("moonshotai/kimi-k3", 262144), 262144)
 assert.equal(I.outputOf("unknown-model", 500000), 500000)
 assert.equal(I.outputOf("unknown-model", 0), 0)
 assert.equal(I.modelOf({ id: "posthog" }, I.REGIONS.us, I.fromGateway("moonshotai/kimi-k3", { context_window: 1048576 })).limit.output, 524288)
+
+// ---- the parameters the GPT models refuse -------------------------------------
+// the gateway serves them on OpenAI's terms: max_tokens and a sampling value
+// are a 400 naming the parameter, so the body is mended and asked again
+const why = (param, message, code = "unsupported_parameter") =>
+  JSON.stringify({ error: { message, type: "invalid_request_error", param, code } })
+const mended = (body, refusal) => {
+  const out = I.repair(JSON.stringify(body), refusal)
+  return out === null ? null : JSON.parse(out)
+}
+// max_tokens becomes the field those models take, at the same value
+assert.deepEqual(mended({ model: "gpt-5", max_tokens: 64, messages: [] }, why("max_tokens", "Unsupported parameter: 'max_tokens' is not supported with this model. Use 'max_completion_tokens' instead.")), {
+  model: "gpt-5",
+  max_completion_tokens: 64,
+  messages: [],
+})
+// a cap already there is not overwritten
+assert.deepEqual(mended({ max_tokens: 8, max_completion_tokens: 64 }, why("max_tokens", "x")), { max_completion_tokens: 64 })
+// a temperature keeps the one value the model does take, as the message names it
+assert.deepEqual(
+  mended({ temperature: 0.7, messages: [] }, why("temperature", "Unsupported value: 'temperature' does not support 0.7 with this model. Only the default (1) value is supported.", "unsupported_value")),
+  { temperature: 1, messages: [] },
+)
+// a parameter with no stand-in comes out
+for (const p of ["top_p", "presence_penalty", "frequency_penalty", "stop", "logprobs", "top_logprobs", "parallel_tool_calls"]) {
+  assert.deepEqual(mended({ [p]: 1, model: "gpt-5" }, why(p, `Unsupported parameter: '${p}' is not supported with this model.`)), { model: "gpt-5" }, p)
+}
+// a refusal the plugin can't mend is left alone: a real error is shown, not retried
+assert.equal(mended({ model: "gpt-5" }, why("", "You are not allowed to request logprobs from this model", null)), null)
+assert.equal(mended({ model: "gpt-5" }, why("model", "The requested model does not exist")), null)
+// an effort is the caller's choice, not silently changed to another depth
+assert.equal(mended({ reasoning_effort: "max" }, why("reasoning_effort", "Unsupported value: 'reasoning_effort' does not support 'max' with this model.", "unsupported_value")), null)
+// a body that isn't JSON, or isn't text, is not a body to mend
+assert.equal(I.repair(undefined, why("max_tokens", "x")), null)
+assert.equal(I.repair("not json", why("max_tokens", "x")), null)
+assert.equal(I.repair("{}", "not json"), null)
+assert.ok(I.REPAIRS >= 2)
 
 // ---- the allowance ------------------------------------------------------------
 // a plan that pays: the dollar bucket first, then the two valves
