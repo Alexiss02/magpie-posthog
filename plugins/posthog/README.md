@@ -80,9 +80,28 @@ completions.
 
 **Free tier.** A free-plan credential may call exactly four models —
 `zai-org/glm-5.2`, `deepseek-ai/deepseek-v4-flash-0731`, `moonshotai/kimi-k3`,
-`zai-org/glm-5.3-flash` — and those are marked `free`, so magpie badges them and its free-only
-filter picks them. Every other model stays listed with `free` off: asking for one on a free plan
-answers 403 `model_not_allowed`, which the card explains, naming what the free tier does serve.
+`zai-org/glm-5.3-flash` — and those are marked `free` on a free plan, so magpie badges them, and
+its free-only filter picks them. Every other model stays listed with `free` off: asking for one on
+a free plan answers 403 `model_not_allowed`, which the card explains, naming what the free tier does
+serve.
+
+**That list is an allow-list, not an exemption.** `FREE_TIER_MODELS` in
+`products/tasks/backend/logic/services/gateway_model_pin.py` is read in one place —
+`desktop_gateway_token.plan_allowed_models`, which returns it for a free plan and
+`DESKTOP_AGENT_MODELS` for a paid one. Nothing consults it for billing. What bills is the Go
+gateway's per-token cost, taken from litellm's map (`model_cost_service.py`, bridged by
+`model_cost_overrides.py`), and all four carry non-zero prices:
+
+| model | input / token | output / token |
+|---|---|---|
+| `zai-org/glm-5.2` | `1.4e-6` | `4.4e-6` |
+| `zai-org/glm-5.3-flash` | `1.5e-7` | `5e-7` |
+| `moonshotai/kimi-k3` | `3e-6` | `1.5e-5` |
+| `deepseek-ai/deepseek-v4-flash-0731` | `1.3e-7` | `2.6e-7` |
+
+So on a **paid** plan those four bill like every other model, and none of them is marked `free`
+here — `free` means "no cost to the plan's allowance", which is true of nothing a paid credential
+calls.
 
 **Reasoning levels.** The gateway takes `minimal`, `low`, `medium`, `high`, `xhigh`, `max` and
 `none` — anything else is a 400. The plugin publishes the ladder each model actually takes, read

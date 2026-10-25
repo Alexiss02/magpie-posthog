@@ -1220,10 +1220,14 @@ export const PostHogAuthPlugin = async ({ client }, options = {}) => ({
           const m = fromGateway(id, raw)
           if (!m.npm) continue // a shape magpie can't speak
           remember(m)
-          // free is what the plan serves without paying: a paid credential calls
-          // the whole list, and then only the free tier's models are free; a free
-          // one calls exactly the free tier, and those are all of them
-          if (allowed && gw.plan !== "paid") m.free = names.some((n) => allowed.has(n))
+          // free is what the plan serves at no cost to its allowance. A free
+          // credential calls exactly the tier, and none of it bills. A paid one
+          // bills every model it calls, the tier's included: 1.08M tokens of
+          // deepseek-v4-flash-0731 on a paid plan moved used_usd by its list
+          // price to the cent, and FREE_TIER_MODELS is only the free plan's
+          // allow-list (desktop_gateway_token.plan_allowed_models), never a
+          // billing exemption. So nothing is marked free there.
+          m.free = gw.plan !== "paid" && (allowed ? names.some((n) => allowed.has(n)) : FREE_TIER.has(id))
           ms.push(m)
         }
         if (!ms.length) return own(provider, s.region)

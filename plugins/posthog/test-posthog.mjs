@@ -509,6 +509,33 @@ try {
   assert.equal(live["zai-org/glm-5.2"].api.npm, "@ai-sdk/openai-compatible")
   assert.equal(live["claude-opus-5"].api.npm, "@ai-sdk/anthropic")
   assert.equal(mintedAt, 1) // the mint is held, not asked again for the list
+  // a paid credential calls the whole list, and bills for every model on it,
+  // the free tier's included: none of them is marked free
+  const prevFetch = globalThis.fetch
+  globalThis.fetch = async (url, init = {}) => {
+    const u = String(url)
+    if (u.endsWith("/desktop/gateway_token/")) {
+      return json(
+        {
+          token: "phe_paid",
+          expires_at: new Date(Date.now() + 300e3).toISOString(),
+          gateway_url: "https://ai-gateway.us.posthog.com",
+          plan: "paid",
+          allowed_models: ["zai-org/glm-5.2", "claude-opus-5"],
+          product_models: ["zai-org/glm-5.2", "claude-opus-5"],
+        },
+        201,
+      )
+    }
+    if (u.endsWith("/v1/models")) return json({ object: "list", data: gatewayModels, models: gatewayModels })
+    if (u.endsWith("/v1/responses")) return new Response("{}", { status: 200 })
+    return json({ error: { message: "unexpected" } }, 404)
+  }
+  const paid = await hooks.provider.models({ id: "posthog" }, { auth: { ...signed, access: "pha_paid" } })
+  assert.equal(Object.keys(paid).length, 2)
+  assert.equal(paid["zai-org/glm-5.2"].free, false)
+  assert.equal(paid["claude-opus-5"].free, false)
+  globalThis.fetch = prevFetch
 
   // usage reads the cloud's own endpoint
   const usage = await hooks.auth.usage(async () => signed)
