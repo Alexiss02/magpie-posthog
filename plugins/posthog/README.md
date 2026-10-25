@@ -92,14 +92,24 @@ off the gateway rather than copied from Desktop's catalog:
 |---|---|
 | Opus 4.6 and up, Fable 5 / 5.1, Sonnet 5 / 5.5 | `low` `medium` `high` `xhigh` `max` |
 | Sonnet 4.6 | `low` `medium` `high` `max` (no `xhigh`) |
-| Opus 4.5, GPT-5, GPT-5 mini | `low` `medium` `high` (GPT-5 also `minimal`) |
-| GPT-5.2 and up, every GPT-6 | `low` `medium` `high` `xhigh` |
+| Opus 4.5 | `low` `medium` `high` |
+| GPT-5, GPT-5 mini | `minimal` `low` `medium` `high` |
+| GPT-5.4, GPT-5.5, GPT-6 Astra, GPT-6.1 Sol | `low` `medium` `high` `xhigh` |
+| GPT-5.6 Sol / Terra / Luna, GPT-6 Sol, GPT-6 Luna | `none` `low` `medium` `high` `xhigh` |
 | GLM family | `high` `max` |
 | Kimi K3, DeepSeek V4 Flash, DeepSeek V4.1 Flash Fast | none — no effort control |
 
 Desktop's catalog offers `max` to every GPT model; the gateway answers `Unsupported value:
 'reasoning_effort' does not support 'max'` for all of them, so it is on no GPT ladder here.
-`ultracode` is Desktop's own top rung and not a gateway value, so it is on none either.
+`ultracode` is Desktop's own top rung and not a gateway value — `/v1/messages` answers
+`output_config.effort: Input should be 'low', 'medium', 'high', 'xhigh' or 'max'` — so it is on
+none either. `none` is on the three families that take it and turns thinking off; the older GPTs
+answer `does not support 'none' with this model`.
+
+A level reaches the model under the key its API reads it from: the Messages API takes an effort as
+`output_config.effort`, which its AI SDK package sets from `effort`, while the OpenAI-shaped APIs
+take `reasoning_effort`, set from `reasoningEffort`. A level filed under the other key is dropped
+and the model thinks at its default, so the two are kept apart per model.
 
 **Parameters the GPT models refuse.** The gateway serves the GPT models on OpenAI's terms: they
 reject `max_tokens` (`Use 'max_completion_tokens' instead`), a `temperature` other than their one

@@ -130,8 +130,11 @@ assert.equal(I.levelsOf("claude-opus-4-5").join(","), "low,medium,high")
 assert.equal(I.levelsOf("claude-sonnet-4-6").join(","), "low,medium,high,max")
 assert.equal(I.levelsOf("gpt-5").join(","), "minimal,low,medium,high")
 assert.equal(I.levelsOf("gpt-5.5").join(","), "low,medium,high,xhigh")
-assert.equal(I.levelsOf("gpt-5.6-sol").join(","), "low,medium,high,xhigh")
+assert.equal(I.levelsOf("gpt-5.6-sol").join(","), "none,low,medium,high,xhigh")
 assert.equal(I.levelsOf("gpt-6.1-sol").join(","), "low,medium,high,xhigh")
+assert.equal(I.levelsOf("gpt-6-sol").join(","), "none,low,medium,high,xhigh")
+assert.equal(I.levelsOf("gpt-6-astra").join(","), "low,medium,high,xhigh")
+assert.equal(I.levelsOf("gpt-5").includes("none"), false)
 // GLM takes two depths, not the ladder
 assert.deepEqual(I.levelsOf("zai-org/glm-5.3-flash"), ["high", "max"])
 assert.deepEqual(I.levelsOf("zai-org/glm-5.2"), ["high", "max"])
@@ -143,6 +146,13 @@ assert.equal(I.levelsOf("gpt-5.4").join(","), "low,medium,high,xhigh")
 assert.equal(I.levelsOf("gpt-5.3-codex").join(","), "low,medium,high")
 // an unnamed Claude model yields none: PostHog never gave it a depth to pick
 assert.deepEqual(I.levelsOf("claude-unnamed-9"), [])
+// a level reaches the model under the key its API reads it from: the Messages
+// API takes an effort as output_config.effort (the AI SDK's `effort`), the
+// OpenAI-shaped ones take reasoning_effort (`reasoningEffort`). Filed under the
+// other key it is dropped and the model thinks at its default.
+assert.deepEqual(I.variants(["high"], "@ai-sdk/anthropic"), { high: { effort: "high" } })
+assert.deepEqual(I.variants(["high"], "@ai-sdk/openai-compatible"), { high: { reasoningEffort: "high" } })
+assert.deepEqual(I.variants([], "@ai-sdk/anthropic"), {})
 
 // ---- the reply limit ----------------------------------------------------------
 // the window is what a prompt and its reply share; Kimi's backend rejects a sum

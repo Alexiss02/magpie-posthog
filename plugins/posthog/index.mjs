@@ -237,6 +237,9 @@ const nameOf = (id, given) => NAMES[id] ?? (given && given !== id ? given : id)
 const STANDARD = ["low", "medium", "high"]
 const THROUGH_MAX = [...STANDARD, "xhigh", "max"]
 const THROUGH_XHIGH = [...STANDARD, "xhigh"]
+// the GPT-5.6 / GPT-6 Sol / GPT-6 Luna families also take "none", which turns
+// thinking off; gpt-6-astra, gpt-6.1-sol and gpt-5 refuse it
+const NONE_THROUGH_XHIGH = ["none", ...THROUGH_XHIGH]
 const GLM = ["high", "max"]
 
 const EFFORTS = {
@@ -256,12 +259,12 @@ const EFFORTS = {
   "gpt-5.2": THROUGH_XHIGH,
   "gpt-5.4": THROUGH_XHIGH,
   "gpt-5.5": THROUGH_XHIGH,
-  "gpt-5.6-sol": THROUGH_XHIGH,
-  "gpt-5.6-terra": THROUGH_XHIGH,
-  "gpt-5.6-luna": THROUGH_XHIGH,
+  "gpt-5.6-sol": NONE_THROUGH_XHIGH,
+  "gpt-5.6-terra": NONE_THROUGH_XHIGH,
+  "gpt-5.6-luna": NONE_THROUGH_XHIGH,
   "gpt-6-astra": THROUGH_XHIGH,
-  "gpt-6-sol": THROUGH_XHIGH,
-  "gpt-6-luna": THROUGH_XHIGH,
+  "gpt-6-sol": NONE_THROUGH_XHIGH,
+  "gpt-6-luna": NONE_THROUGH_XHIGH,
   "gpt-6.1-sol": THROUGH_XHIGH,
   "zai-org/glm-5.2": GLM,
   "@cf/zai-org/glm-5.2": GLM,
@@ -276,10 +279,10 @@ const EFFORTS = {
 // doesn't (gpt-5.3-codex): the longest matching prefix wins.
 const FAMILY_EFFORTS = [
   ["gpt-6-astra", THROUGH_XHIGH],
-  ["gpt-6-sol", THROUGH_XHIGH],
+  ["gpt-6-sol", NONE_THROUGH_XHIGH],
   ["gpt-6.1-sol", THROUGH_XHIGH],
-  ["gpt-6-luna", THROUGH_XHIGH],
-  ["gpt-5.6", THROUGH_XHIGH],
+  ["gpt-6-luna", NONE_THROUGH_XHIGH],
+  ["gpt-5.6", NONE_THROUGH_XHIGH],
   ["gpt-5.5", THROUGH_XHIGH],
   ["gpt-5.4", THROUGH_XHIGH],
   ["gpt-5.2", THROUGH_XHIGH],
@@ -341,8 +344,14 @@ const price = (v) => {
   return Number.isFinite(n) && n >= 0 ? n : 0
 }
 
-function variants(levels) {
-  return Object.fromEntries((levels ?? []).map((e) => [e, { reasoningEffort: e }]))
+// variants is a model at each level it takes, with what the API it is spoken to
+// on reads that level from. Anthropic's Messages API takes an effort as
+// output_config.effort, which its AI SDK package sets from `effort`; the
+// OpenAI-shaped APIs take reasoning_effort, from `reasoningEffort`. A level
+// filed under the other key is dropped and the model thinks at its default.
+function variants(levels, npm) {
+  const key = npm === NPM_MESSAGES ? "effort" : "reasoningEffort"
+  return Object.fromEntries((levels ?? []).map((e) => [e, { [key]: e }]))
 }
 
 function modelOf(provider, region, m) {
@@ -368,7 +377,7 @@ function modelOf(provider, region, m) {
       interleaved: false,
     },
     release_date: "",
-    variants: variants(levels),
+    variants: variants(levels, npm),
     // magpie's own: served at no cost to the plan's allowance — the free tier's
     // models, which need no paid plan; the account's own mark when the mint gave
     // one (models(), below)
@@ -1408,6 +1417,7 @@ export const _internal = {
   who,
   fromGateway,
   levelsOf,
+  variants,
   outputOf,
   npmOf,
   modelOf,
