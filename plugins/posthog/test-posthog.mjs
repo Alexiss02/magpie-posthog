@@ -195,11 +195,12 @@ assert.equal(I.repair("{}", "not json"), null)
 assert.ok(I.REPAIRS >= 2)
 
 // ---- the allowance ------------------------------------------------------------
-// a plan that pays: the dollar bucket first, then the two valves
+// the plan's dollars, and no valve: burst and sustained are the retired
+// gateway's exempt windows, built at 0% by construction
 const u = I.usageOf({
   product: "posthog_code",
-  burst: { used_percent: 12.5, resets_in_seconds: 86400, reset_at: "2026-10-26T00:00:00Z", exceeded: false },
-  sustained: { used_percent: 3, resets_in_seconds: 2592000, reset_at: "2026-11-24T00:00:00Z", exceeded: false },
+  burst: { used_percent: 0, resets_in_seconds: 86400, reset_at: "2026-10-26T00:00:00Z", exceeded: false },
+  sustained: { used_percent: 0, resets_in_seconds: 2592000, reset_at: "2026-11-24T00:00:00Z", exceeded: false },
   ai_credits: { exhausted: false, used_usd: 0.48, limit_usd: 20, breakdown: { token_credits: 48 } },
   is_rate_limited: false,
   is_pro: false,
@@ -207,34 +208,33 @@ const u = I.usageOf({
   billing_period_end: "2026-11-13T05:58:42.090000Z",
 })
 assert.equal(u.plan, "Desktop")
-assert.deepEqual(u.windows.map((w) => w.name), ["Credits", "Burst", "Sustained"])
+assert.deepEqual(u.windows.map((w) => w.name), ["Credits"])
 assert.equal(u.windows[0].display, "$0.48 / $20.00")
 assert.equal(u.windows[0].amount, 0.48)
 assert.equal(u.windows[0].limit, 20)
 assert.equal(u.windows[0].unit, "usd")
 assert.equal(u.windows[0].used, 2.4)
 assert.equal(u.windows[0].resetsAt, "2026-11-13T05:58:42.090Z")
-assert.equal(u.windows[1].used, 12.5)
-assert.equal(u.windows[1].resetSecs, 86400)
 assert.equal(u.until, "2026-11-13T05:58:42.090Z")
 
-// a free plan (code usage not subscribed) shows its sustained valve and no
-// dollars, as Desktop's own codeUsageMeter does; burst is meaningless there
-const free = I.usageOf({
+// a valve that moves is a valve the backend means: it is shown, so the card
+// follows the server rather than assuming it stays exempt
+const moved = I.usageOf({
   burst: { used_percent: 40, resets_in_seconds: 86400, reset_at: "2026-10-26T00:00:00Z", exceeded: false },
   sustained: { used_percent: 1, resets_in_seconds: 2592000, reset_at: "2026-11-24T00:00:00Z", exceeded: false },
   ai_credits: { exhausted: false, used_usd: null, limit_usd: null, breakdown: null },
   is_pro: false,
   code_usage_subscribed: false,
-  billing_period_end: "2026-11-13T05:58:42.090000Z",
 })
-assert.equal(free.plan, "Free")
-assert.deepEqual(free.windows.map((w) => w.name), ["Sustained"])
-assert.equal(free.windows[0].used, 1)
+assert.equal(moved.plan, "Free")
+assert.deepEqual(moved.windows.map((w) => w.name), ["Burst", "Sustained"])
+assert.equal(moved.windows[0].used, 40)
+assert.equal(moved.windows[0].resetSecs, 86400)
+assert.equal(moved.windows[1].used, 1)
 
-// an absent code_usage_subscribed is unknown, not free: both valves stay
-const unknown = I.usageOf({ burst: { used_percent: 1 }, sustained: { used_percent: 2 } })
-assert.deepEqual(unknown.windows.map((w) => w.name), ["Burst", "Sustained"])
+// a plan that pays and whose dollars billing hasn't synced yet has no meter,
+// not a 0% one: an empty card says "nothing reported", a 0% one would lie
+assert.deepEqual(I.usageOf({ code_usage_subscribed: true, ai_credits: { used_usd: null, limit_usd: null } }).windows, [])
 // and a usage read with nothing in it is a plan with no windows
 assert.deepEqual(I.usageOf({}).windows, [])
 assert.deepEqual(I.usageOf(undefined).windows, [])

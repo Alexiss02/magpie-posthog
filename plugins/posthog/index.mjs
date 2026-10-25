@@ -767,13 +767,14 @@ const ISO = (v) => {
 }
 
 // usageOf is the plan's allowance as /api/projects/{id}/desktop/usage/ reports
-// it: the plan's dollar bucket when the account's billing reports one, then the
-// burst (daily) and sustained (30-day) valves.
+// it: the plan's dollar bucket, and a valve only while it says something.
 //
-// A plan with no dollars (code usage not subscribed, and no bucket reported)
-// shows only its sustained valve, as Desktop's own codeUsageMeter does: burst is
-// meaningless there. An absent code_usage_subscribed is unknown, not free, and
-// keeps both valves.
+// `burst` (daily) and `sustained` (30-day) are the retired gateway's windows.
+// desktop_access.py builds both with `_exempt_window`, so `used_percent` is 0.0
+// and `exceeded` false by construction, and the gateway's own cost throttles
+// exempt `posthog_code` from them (`_UserCostThrottleBase._is_exempt`). A meter
+// that can only ever read 0% is a meter that lies, so one is shown only once the
+// backend reports it moving or tripped — which today it never does.
 function usageOf(body) {
   const u = body ?? {}
   const out = {
@@ -783,6 +784,8 @@ function usageOf(body) {
   }
   const limit = (name, w) => {
     if (!w || typeof w !== "object") return
+    const moved = Number(w.used_percent) > 0 || w.exceeded === true
+    if (!moved) return
     out.windows.push({
       name,
       used: Math.max(0, Number(w.used_percent) || 0),
@@ -805,12 +808,8 @@ function usageOf(body) {
       ...(ISO(u?.billing_period_end) ? { resetsAt: ISO(u.billing_period_end) } : {}),
     })
   }
-  if (u?.code_usage_subscribed === false) {
-    limit("Sustained", u.sustained)
-  } else {
-    limit("Burst", u.burst)
-    limit("Sustained", u.sustained)
-  }
+  limit("Burst", u.burst)
+  limit("Sustained", u.sustained)
   return out
 }
 
