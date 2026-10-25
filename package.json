@@ -1,6 +1,6 @@
 {
   "name": "PostHog",
-  "version": "0.5.2",
+  "version": "0.5.3",
   "type": "module",
   "main": "./index.mjs",
   "description": "PostHog Desktop's coding plan (PostHog Code) as a magpie / OpenCode provider plugin",

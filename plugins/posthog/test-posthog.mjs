@@ -195,8 +195,9 @@ assert.equal(I.repair("{}", "not json"), null)
 assert.ok(I.REPAIRS >= 2)
 
 // ---- the allowance ------------------------------------------------------------
-// the plan's dollars, and no valve: burst and sustained are the retired
-// gateway's exempt windows, built at 0% by construction
+// the plan's credits, and no valve: burst and sustained are the retired
+// gateway's exempt windows, built at 0% by construction. A credit is a cent, so
+// $20 of plan is 2000 of them.
 const u = I.usageOf({
   product: "posthog_code",
   burst: { used_percent: 0, resets_in_seconds: 86400, reset_at: "2026-10-26T00:00:00Z", exceeded: false },
@@ -209,13 +210,34 @@ const u = I.usageOf({
 })
 assert.equal(u.plan, "Desktop")
 assert.deepEqual(u.windows.map((w) => w.name), ["Credits"])
-assert.equal(u.windows[0].display, "$0.48 / $20.00")
-assert.equal(u.windows[0].amount, 0.48)
-assert.equal(u.windows[0].limit, 20)
-assert.equal(u.windows[0].unit, "usd")
+assert.equal(u.windows[0].display, "48 / 2000 credits")
+assert.equal(u.windows[0].amount, 48)
+assert.equal(u.windows[0].limit, 2000)
+assert.equal(u.windows[0].unit, "credits")
 assert.equal(u.windows[0].used, 2.4)
 assert.equal(u.windows[0].resetsAt, "2026-11-13T05:58:42.090Z")
 assert.equal(u.until, "2026-11-13T05:58:42.090Z")
+
+// the plugin's ceiling is drawn as the window's limit when it is the tighter one:
+// a plan of 2100 credits with 1900 set on the plugin reads against 1900
+const cappedPlan = I.usageOf(
+  { ai_credits: { used_usd: 0.11, limit_usd: 21 }, code_usage_subscribed: true },
+  { usedUsd: 0.11, cap: { credits: 1900, usd: 19 } },
+)
+assert.equal(cappedPlan.windows[0].display, "11 / 1900 credits")
+assert.equal(cappedPlan.windows[0].limit, 1900)
+// a ceiling above the plan's leaves the plan's own the tighter one
+const loose = I.usageOf(
+  { ai_credits: { used_usd: 0.11, limit_usd: 21 }, code_usage_subscribed: true },
+  { usedUsd: 0.11, cap: { credits: 9000, usd: 90 } },
+)
+assert.equal(loose.windows[0].display, "11 / 2100 credits")
+// the meter's own dollars win over the plan's lagging reading
+const ahead = I.usageOf(
+  { ai_credits: { used_usd: 0.11, limit_usd: 21 }, code_usage_subscribed: true },
+  { usedUsd: 12.34, cap: null },
+)
+assert.equal(ahead.windows[0].display, "1234 / 2100 credits")
 
 // a valve that moves is a valve the backend means: it is shown, so the card
 // follows the server rather than assuming it stays exempt
@@ -232,12 +254,103 @@ assert.equal(moved.windows[0].used, 40)
 assert.equal(moved.windows[0].resetSecs, 86400)
 assert.equal(moved.windows[1].used, 1)
 
-// a plan that pays and whose dollars billing hasn't synced yet has no meter,
+// a plan that pays and whose credits billing hasn't synced yet has no meter,
 // not a 0% one: an empty card says "nothing reported", a 0% one would lie
 assert.deepEqual(I.usageOf({ code_usage_subscribed: true, ai_credits: { used_usd: null, limit_usd: null } }).windows, [])
 // and a usage read with nothing in it is a plan with no windows
 assert.deepEqual(I.usageOf({}).windows, [])
 assert.deepEqual(I.usageOf(undefined).windows, [])
+
+// ---- the spend limit ----------------------------------------------------------
+// the ceiling is in credits, a cent each
+assert.deepEqual(I.capOf({ maxCredits: 1900 }), { credits: 1900, usd: 19 })
+assert.deepEqual(I.capOf({ maxCredits: "1900" }), { credits: 1900, usd: 19 })
+assert.equal(I.capOf({}), null)
+assert.equal(I.capOf({ maxCredits: 0 }), null)
+assert.equal(I.capOf({ maxCredits: -1 }), null)
+assert.equal(I.capOf({ maxCredits: "cheap" }), null)
+assert.equal(I.capOf(undefined), null)
+
+// glm-5.2: 1.4e-6 in, 4.4e-6 out, 2.6e-7 cached — 200 fresh + 800 cached + 100 out
+assert.equal(I.costOf("zai-org/glm-5.2", { prompt_tokens: 1000, prompt_tokens_details: { cached_tokens: 800 }, completion_tokens: 100 }).toFixed(9), "0.000928000")
+// the Messages API reports the cached tokens beside the input, not inside it:
+// 100 × 5e-6 + 900 × 5e-7 + 10 × 2.5e-5
+assert.equal(I.costOf("claude-opus-5", { input_tokens: 100, cache_read_input_tokens: 900, output_tokens: 10 }).toFixed(9), "0.001200000")
+// a cache write is priced above a plain prompt token, and at the prompt's own price when unquoted
+assert.equal(I.costOf("claude-opus-5", { input_tokens: 0, cache_creation_input_tokens: 1000, output_tokens: 0 }).toFixed(9), "0.006250000")
+// a model nothing prices costs nothing rather than NaN
+assert.equal(I.costOf("no-such-model", { prompt_tokens: 10, completion_tokens: 10 }), 0)
+assert.equal(I.costOf("zai-org/glm-5.2", null), 0)
+
+// the meter: what the endpoint last said, plus what was spent here since
+I.spent.clear()
+const k = "us\n1\nabc"
+I.noted(k, 1)
+assert.equal(I.spent.get(k).server, 1)
+I.spentOn(k, 0.5)
+assert.equal(I.spent.get(k).since, 0.5)
+// a reading that caught up with what was spent here isn't counted twice
+I.noted(k, 1.5)
+assert.equal(I.spent.get(k).server, 1.5)
+assert.equal(I.spent.get(k).since, 0)
+// a reading that lags keeps the local spend on top of it
+I.spentOn(k, 0.25)
+I.noted(k, 1.5)
+assert.equal(I.spent.get(k).since, 0.25)
+// and a reading with no dollars leaves the meter as it stands
+I.noted(k, null)
+assert.equal(I.spent.get(k).server, 1.5)
+I.spent.clear()
+
+// the usage a reply reports, as its last chunk carries it
+const sse = (usd) =>
+  [
+    'data: {"choices":[{"delta":{"content":"hi"}}]}',
+    `data: {"choices":[],"usage":${JSON.stringify(usd)}}`,
+    "data: [DONE]",
+    "",
+  ].join("\n\n")
+assert.deepEqual(I.lastUsage(sse({ prompt_tokens: 5, completion_tokens: 2 })), { prompt_tokens: 5, completion_tokens: 2 })
+// a stream cut mid-chunk has no usage to read, and one with none at all is null
+assert.equal(I.lastUsage('data: {"choices":[],"usage":{"prompt_tok'), null)
+assert.equal(I.lastUsage("data: [DONE]\n\n"), null)
+// the last one wins when a reply repeats it
+assert.equal(I.lastUsage(sse({ prompt_tokens: 1 }) + sse({ prompt_tokens: 9 })).prompt_tokens, 9)
+
+// metered passes a reply through unchanged and adds its cost
+I.spent.clear()
+const whole = new Response(JSON.stringify({ choices: [], usage: { prompt_tokens: 1000, completion_tokens: 0 } }), {
+  headers: { "content-type": "application/json" },
+})
+const seen = []
+const passed = I.metered(whole, "zai-org/glm-5.2", (usd) => seen.push(usd))
+assert.equal(passed, whole) // unstreamed: the same reply, read beside the caller
+assert.equal((await passed.json()).choices.length, 0)
+await new Promise((r) => setTimeout(r, 0))
+assert.equal(seen.length, 1)
+assert.equal(seen[0].toFixed(9), "0.001400000")
+
+// a streamed reply is scanned as it goes by, never held back for the scan
+const streamed = new Response(sse({ prompt_tokens: 1000, completion_tokens: 100 }), {
+  headers: { "content-type": "text/event-stream" },
+})
+const costs = []
+const through = I.metered(streamed, "zai-org/glm-5.2", (usd) => costs.push(usd))
+assert.equal(through.status, 200)
+assert.equal(through.headers.get("content-type"), "text/event-stream")
+const text = await through.text()
+assert.ok(text.includes("data: [DONE]")) // the caller's copy is whole
+assert.equal(costs.length, 1)
+assert.equal(costs[0].toFixed(9), "0.001840000")
+// a stream that fails before its usage is metered as nothing, not as an error
+const cut = I.metered(new Response("data: {\"choices\":[]}\n\n", { headers: { "content-type": "text/event-stream" } }), "zai-org/glm-5.2", (usd) => costs.push(usd))
+await cut.text()
+assert.equal(costs.length, 1)
+I.spent.clear()
+
+// what the plugin says when its own ceiling holds a request back
+assert.match(I.capped(19.54, { credits: 1950, usd: 19.5 }), /credit cap is reached: the plan is at 1954 of the 1950 credits/)
+assert.match(I.capped(19.54, { credits: 1950, usd: 19.5 }), /maxCredits/)
 
 // ---- a refusal keeps the sign-in and says what it means ----------------------
 const refused = await I.explained(
@@ -465,6 +578,130 @@ try {
 } finally {
   globalThis.fetch = realFetch
   I.minted.clear()
+  I.spent.clear()
+  I.usageReads.clear()
+}
+
+// ---- the spend limit, through the hooks ---------------------------------------
+// the plan's own dollars lag by up to a day (posthog/tasks/scheduled.py sends the
+// usage report at 3:45 UTC), so the plugin's ceiling counts what this process has
+// spent since the last reading on top of it
+{
+  const realFetch = globalThis.fetch
+  let planUsd = 18.9
+  let calls = 0
+  let reads = 0
+  let cost = 0.07 // what each reply below costs: 50000 prompt tokens of glm-5.2 at 1.4e-6
+  const caps = []
+  try {
+    globalThis.fetch = async (url, init = {}) => {
+      const u = String(url)
+      if (u.endsWith("/desktop/gateway_token/")) {
+        return json(
+          {
+            token: "phe_cap",
+            expires_at: new Date(Date.now() + 300e3).toISOString(),
+            gateway_url: "https://ai-gateway.us.posthog.com",
+            plan: "paid",
+            allowed_models: null,
+            product_models: ["zai-org/glm-5.2"],
+          },
+          201,
+        )
+      }
+      if (u.endsWith("/desktop/usage/")) {
+        reads += 1
+        return json({
+          product: "posthog_code",
+          burst: { used_percent: 0, resets_in_seconds: 86400, reset_at: "2026-10-26T00:00:00Z", exceeded: false },
+          sustained: { used_percent: 0, resets_in_seconds: 2592000, reset_at: "2026-11-24T00:00:00Z", exceeded: false },
+          ai_credits: { exhausted: false, used_usd: planUsd, limit_usd: 21, breakdown: null },
+          is_rate_limited: false,
+          is_pro: false,
+          code_usage_subscribed: true,
+          billing_period_end: "2026-11-25T11:05:41Z",
+        })
+      }
+      if (u.endsWith("/v1/chat/completions")) {
+        calls += 1
+        return json({
+          choices: [{ message: { content: "hi" } }],
+          usage: { prompt_tokens: Math.round(cost / 1.4e-6), completion_tokens: 0 }, // glm-5.2 input, so the reply costs exactly `cost`
+        })
+      }
+      throw new Error("unexpected fetch: " + u)
+    }
+    const acct = { ...signed, access: "pha_cap" }
+    const plugin = await PostHogAuthPlugin({ client }, { maxCredits: 1900 })
+    const loader = await plugin.auth.loader(async () => acct)
+
+    // the plan reads $18.90 of its $21 (2100 credits), and nothing is spent here yet
+    const first = await loader.fetch("https://ai-gateway.us.posthog.com/v1/chat/completions", {
+      method: "POST",
+      body: JSON.stringify({ model: "zai-org/glm-5.2" }),
+    })
+    assert.equal(first.status, 200)
+    assert.equal(calls, 1)
+    assert.equal(reads, 1) // one reading for the first send
+    await new Promise((r) => setTimeout(r, 0))
+
+    // the card reads in credits, against the ceiling the plugin enforces:
+    // $18.90 of the plan's $21 plus one $0.07 reply is 1897 of the 1900 set here
+    const card = await plugin.auth.usage(async () => acct)
+    assert.deepEqual(card.windows.map((w) => w.name), ["Credits"])
+    assert.equal(card.windows[0].display, "1897 / 1900 credits")
+    assert.equal(card.windows[0].limit, 1900)
+    assert.equal(card.windows[0].unit, "credits")
+    assert.equal(card.windows[0].resetsAt, "2026-11-25T11:05:41.000Z")
+    assert.equal(reads, 2) // the card's own read
+
+    // a second send inside the reading's window doesn't ask again
+    const second = await loader.fetch("https://ai-gateway.us.posthog.com/v1/chat/completions", {
+      method: "POST",
+      body: JSON.stringify({ model: "zai-org/glm-5.2" }),
+    })
+    assert.equal(second.status, 200)
+    await new Promise((r) => setTimeout(r, 0))
+    assert.equal(reads, 2) // inside the reading's window: no second read
+
+    // the third would cross it: refused here, with what to do
+    await assert.rejects(
+      loader.fetch("https://ai-gateway.us.posthog.com/v1/chat/completions", {
+        method: "POST",
+        body: JSON.stringify({ model: "zai-org/glm-5.2" }),
+      }),
+      /credit cap is reached: the plan is at 1904 of the 1900 credits/,
+    )
+    assert.equal(calls, 2) // the refused one never went out
+
+    // the plan's own reading catching up doesn't spend the ceiling twice:
+    // 19.04 of dollars is 1904 credits either way
+    planUsd = 19.04
+    I.usageReads.clear()
+    const still = await plugin.auth.usage(async () => acct)
+    assert.equal(still.windows[0].display, "1904 / 1900 credits")
+    assert.equal(still.windows[0].used, 100)
+
+    // no option, no ceiling: the same account sends freely
+    const open = await PostHogAuthPlugin({ client })
+    const free = await open.auth.loader(async () => acct)
+    const went = await free.fetch("https://ai-gateway.us.posthog.com/v1/chat/completions", {
+      method: "POST",
+      body: JSON.stringify({ model: "zai-org/glm-5.2" }),
+    })
+    assert.equal(went.status, 200)
+    assert.equal(calls, 3)
+    const plain = await open.auth.usage(async () => acct)
+    assert.deepEqual(plain.windows.map((w) => w.name), ["Credits"])
+    // with no ceiling, the plan's own 2100 is what the card reads against
+    assert.equal(plain.windows[0].limit, 2100)
+    void caps
+  } finally {
+    globalThis.fetch = realFetch
+    I.minted.clear()
+    I.spent.clear()
+    I.usageReads.clear()
+  }
 }
 
 // ---- the hooks, live ---------------------------------------------------------

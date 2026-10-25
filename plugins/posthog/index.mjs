@@ -766,8 +766,213 @@ const ISO = (v) => {
   return Number.isNaN(d.getTime()) ? undefined : d.toISOString()
 }
 
+// ---- the spend limit ---------------------------------------------------------
+
+// A plugin option caps what the plan's own credits may reach: `maxCredits`, set
+// with
+//
+//   magpie plugin options posthog '{"maxCredits": 1900}'
+//
+// A credit is a cent — the usage endpoint's `used_usd` is the bucket's credits at
+// `_USD_PER_CREDIT = 0.01` (desktop_access.py), so a plan whose `limit_usd` is
+// 21 holds 2100 of them. The cap is the user's ceiling under the plan's own, and
+// what the plugin refuses past.
+//
+// The plan's reading alone cannot hold it: posthog/tasks/scheduled.py sends the
+// usage report at 3:45 UTC and ee/billing/quota_limiting.py reads what it wrote,
+// so `used_usd` lags by up to a day and a day's spend would cross the cap before
+// the number moved. What this process has spent since that reading is added to
+// it, priced from the gateway's own per-token figures.
+const BUDGET_EVERY_MS = 5 * 60_000
+const USD_PER_CREDIT = 0.01
+
+// capOf is the ceiling set on the plugin, in credits and in dollars, or null.
+const capOf = (options) => {
+  const v = Number(options?.maxCredits)
+  return Number.isFinite(v) && v > 0 ? { credits: v, usd: v * USD_PER_CREDIT } : null
+}
+
+// PRICES is what each model costs per token, by lower-case id: the gateway's own
+// list once models() has read it, the fallback table until then.
+const PRICES = new Map(
+  FALLBACK.map(([id, , prompt, completion, read, write]) => [
+    id,
+    { input: price(prompt), output: price(completion), read: price(read), write: price(write) },
+  ]),
+)
+
+// remember takes a model's prices as the gateway lists them.
+const remember = (m) =>
+  PRICES.set(String(m.id).toLowerCase(), { input: m.input, output: m.output, read: m.read, write: m.write })
+
+// costOf is one reply's cost in dollars, from the usage it reports: the prompt's
+// uncached and cached parts at their own prices, the completion's at its. Both
+// shapes are read: chat completions counts the cached tokens inside
+// prompt_tokens, the Messages API reports them beside input_tokens.
+function costOf(id, u) {
+  const p = PRICES.get(String(id ?? "").toLowerCase())
+  if (!p || !u) return 0
+  const prompt = Number(u.prompt_tokens ?? u.input_tokens) || 0
+  const cached = Number(u.prompt_tokens_details?.cached_tokens ?? u.cache_read_input_tokens) || 0
+  const written = Number(u.cache_creation_input_tokens) || 0
+  const output = Number(u.completion_tokens ?? u.output_tokens) || 0
+  const fresh = u.prompt_tokens === undefined ? prompt : Math.max(0, prompt - cached)
+  // a cache write costs more than a plain prompt token; where the gateway quotes
+  // no write price, the prompt's own is the floor
+  return fresh * p.input + cached * p.read + written * (p.write || p.input) + output * p.output
+}
+
+// spent is each project's plan as this process knows it: the dollars the usage
+// endpoint last reported, and what has been spent here since.
+const spent = new Map()
+const spendKey = (s) => `${s.region.id}\n${projectOf(s.auth)}\n${s.bearer.slice(-12)}`
+const blank = () => ({ server: 0, since: 0, at: 0 })
+const usedOf = (m) => (m ? m.server + m.since : 0)
+
+// noted folds a reading of the usage endpoint into the meter: its dollars are the
+// floor, and what was spent here is cut by however much they grew, so a reading
+// that caught up isn't counted twice.
+function noted(key, usedUsd) {
+  const m = spent.get(key) ?? blank()
+  if (Number.isFinite(usedUsd)) {
+    m.since = Math.max(0, m.since - Math.max(0, usedUsd - m.server))
+    m.server = usedUsd
+  }
+  m.at = Date.now()
+  spent.set(key, m)
+  return m
+}
+
+// spentOn adds one reply's cost to what this process has spent.
+function spentOn(key, usd) {
+  if (!(usd > 0)) return
+  const m = spent.get(key) ?? blank()
+  m.since += usd
+  spent.set(key, m)
+}
+
+// jsonAt parses the object that opens at text[i], or null when it doesn't close
+// whole — a stream's tail is cut wherever the chunk ended.
+function jsonAt(text, i) {
+  if (i < 0) return null
+  let depth = 0
+  for (let k = i; k < text.length; k++) {
+    const c = text[k]
+    if (c === "{") depth++
+    else if (c === "}" && --depth === 0) {
+      try {
+        return JSON.parse(text.slice(i, k + 1))
+      } catch {
+        return null
+      }
+    }
+  }
+  return null
+}
+
+// lastUsage is the last usage object in text that parses whole.
+function lastUsage(text) {
+  let at = text.length
+  while ((at = text.lastIndexOf('"usage"', at - 1)) >= 0) {
+    const u = jsonAt(text, text.indexOf("{", at))
+    if (u) return u
+  }
+  return null
+}
+
+// metered passes a reply through unchanged and adds what it cost to the meter,
+// from the usage it reports at its end: a streamed reply's last chunk, or the
+// whole body of an unstreamed one. Nothing is held back — the stream is scanned
+// as it goes by, never buffered for it.
+function metered(res, id, add) {
+  if (!res.body) return res
+  const read = (u) => {
+    const usd = costOf(id, u)
+    if (usd > 0) add(usd)
+  }
+  if (!(res.headers.get("content-type") ?? "").includes("text/event-stream")) {
+    // a whole reply: read beside the caller, who keeps its own copy
+    res
+      .clone()
+      .json()
+      .then((body) => read(body?.usage), () => {})
+    return res
+  }
+  let tail = ""
+  const dec = new TextDecoder()
+  const scan = new TransformStream({
+    transform(chunk, ctrl) {
+      ctrl.enqueue(chunk)
+      tail = (tail + dec.decode(chunk, { stream: true })).slice(-8192)
+    },
+    flush() {
+      read(lastUsage(tail))
+    },
+  })
+  return new Response(res.body.pipeThrough(scan), { status: res.status, statusText: res.statusText, headers: res.headers })
+}
+
+// capped is what the plugin says when its own ceiling holds the request back.
+const capped = (usedUsd, cap) => {
+  const used = Math.round(usedUsd / USD_PER_CREDIT)
+  return (
+    `this plugin's credit cap is reached: the plan is at ${used} of the ${cap.credits} credits set on it (maxCredits). ` +
+    `Raise it with magpie plugin options posthog '{"maxCredits": <credits>}', or wait for the billing period to end.`
+  )
+}
+
+// usageReads is each project's last reading of the usage endpoint, and the read
+// under way: a request path asks once per BUDGET_EVERY_MS, not once per call.
+const usageReads = new Map()
+
+// readUsage asks for the plan's dollars and folds them into the meter. A failed
+// read keeps the last good one, so an outage never reads as "nothing spent".
+async function readUsage(s) {
+  const key = spendKey(s)
+  const was = usageReads.get(key)
+  if (was?.inFlight) return was.inFlight
+  if (was && Date.now() - was.at < BUDGET_EVERY_MS) return was.value
+  const entry = { at: was?.at ?? 0, value: was?.value ?? null, inFlight: null }
+  entry.inFlight = (async () => {
+    try {
+      const res = await fetch(usageUrl(s.region, projectOf(s.auth)), {
+        headers: { Authorization: `Bearer ${s.bearer}`, Accept: "application/json" },
+        signal: AbortSignal.timeout(20000),
+      })
+      if (!res.ok) return entry.value
+      const body = await res.json()
+      noted(key, body?.ai_credits?.used_usd)
+      entry.value = body
+      entry.at = Date.now()
+      return body
+    } catch {
+      return entry.value
+    } finally {
+      entry.inFlight = null
+    }
+  })()
+  usageReads.set(key, entry)
+  return entry.inFlight
+}
+
+// modelIn is the model a request body names, "" when it names none.
+const modelIn = (body) => {
+  try {
+    return JSON.parse(typeof body === "string" ? body : "")?.model ?? ""
+  } catch {
+    return ""
+  }
+}
+
 // usageOf is the plan's allowance as /api/projects/{id}/desktop/usage/ reports
-// it: the plan's dollar bucket, and a valve only while it says something.
+// it, in the plan's own unit: credits. A credit is a cent — the endpoint's
+// `used_usd` is the bucket's credits at `_USD_PER_CREDIT = 0.01`
+// (desktop_access.py), so `limit_usd: 21` is 2100 of them.
+//
+// `meter` is what this process knows of the spend: its dollars (the plan's last
+// reading plus what has been spent here since) and the ceiling set on the plugin.
+// The ceiling is drawn as the window's own limit when it is under the plan's, so
+// the card reads what a request is actually held at.
 //
 // `burst` (daily) and `sustained` (30-day) are the retired gateway's windows.
 // desktop_access.py builds both with `_exempt_window`, so `used_percent` is 0.0
@@ -775,7 +980,7 @@ const ISO = (v) => {
 // exempt `posthog_code` from them (`_UserCostThrottleBase._is_exempt`). A meter
 // that can only ever read 0% is a meter that lies, so one is shown only once the
 // backend reports it moving or tripped — which today it never does.
-function usageOf(body) {
+function usageOf(body, meter = {}) {
   const u = body ?? {}
   const out = {
     plan: u?.is_pro ? "Pro" : u?.code_usage_subscribed ? "Desktop" : "Free",
@@ -794,17 +999,26 @@ function usageOf(body) {
     })
   }
   const credits = u?.ai_credits
-  const usedUsd = Number.isFinite(credits?.used_usd) ? credits.used_usd : null
-  const limitUsd = Number.isFinite(credits?.limit_usd) ? credits.limit_usd : null
-  if (usedUsd !== null && limitUsd !== null && limitUsd > 0) {
-    // the plan's dollars, as Desktop's codeUsageMeter draws them
+  const planUsd = Number.isFinite(credits?.limit_usd) ? credits.limit_usd : null
+  const planCredits = planUsd !== null && planUsd > 0 ? Math.round(planUsd / USD_PER_CREDIT) : null
+  // what is spent: the meter when the plugin keeps one (it counts this process's
+  // own calls on top of the plan's lagging reading), the plan's figure else
+  const usedUsd = Number.isFinite(meter.usedUsd)
+    ? meter.usedUsd
+    : Number.isFinite(credits?.used_usd)
+      ? credits.used_usd
+      : null
+  // the ceiling: the plugin's when it is the tighter one, the plan's otherwise
+  const cap = meter.cap ?? null
+  const ceiling = cap ? (planCredits !== null ? Math.min(planCredits, cap.credits) : cap.credits) : planCredits
+  if (usedUsd !== null && ceiling) {
     out.windows.push({
       name: "Credits",
-      used: Math.min(100, (100 * usedUsd) / limitUsd),
-      display: `$${usedUsd.toFixed(2)} / $${limitUsd.toFixed(2)}`,
-      amount: usedUsd,
-      limit: limitUsd,
-      unit: "usd",
+      used: Math.min(100, (100 * usedUsd) / (ceiling * USD_PER_CREDIT)),
+      display: `${Math.round(usedUsd / USD_PER_CREDIT)} / ${ceiling} credits`,
+      amount: Math.round(usedUsd / USD_PER_CREDIT),
+      limit: ceiling,
+      unit: "credits",
       ...(ISO(u?.billing_period_end) ? { resetsAt: ISO(u.billing_period_end) } : {}),
     })
   }
@@ -929,7 +1143,7 @@ const kept = (res) => {
 
 // ---- the plugin --------------------------------------------------------------
 
-export const PostHogAuthPlugin = async ({ client }) => ({
+export const PostHogAuthPlugin = async ({ client }, options = {}) => ({
   config: async (config) => {
     config.provider ??= {}
     config.provider.posthog ??= {}
@@ -978,6 +1192,7 @@ export const PostHogAuthPlugin = async ({ client }) => ({
           if (BLOCKED.has(String(id).toLowerCase())) continue
           const m = fromGateway(id, raw)
           if (!m.npm) continue // a shape magpie can't speak
+          remember(m)
           // free is what the plan serves without paying: a paid credential calls
           // the whole list, and then only the free tier's models are free; a free
           // one calls exactly the free tier, and those are all of them
@@ -1059,6 +1274,16 @@ export const PostHogAuthPlugin = async ({ client }) => ({
           } catch (e) {
             throw Object.assign(new Error(explainedMint(e)), { signIn: e?.signIn ?? "kept" })
           }
+          // the ceiling set on the plugin, checked before every send: the plan's
+          // own dollars as last read, plus what this process has spent since
+          const cap = capOf(options)
+          const key = spendKey(s)
+          if (cap !== null) {
+            await readUsage(s)
+            const used = usedOf(spent.get(key))
+            if (used >= cap.usd) throw Object.assign(new Error(capped(used, cap)), { signIn: "kept" })
+          }
+          const model = modelIn(body)
           let res = await send(gw.token, gw.gateway)
           if (res.status === 401) {
             // a token past its end (or one the gateway dropped): mint again, once
@@ -1080,7 +1305,9 @@ export const PostHogAuthPlugin = async ({ client }) => ({
             }
             res = await send(gw.token, gw.gateway)
           }
-          return res.status >= 400 ? explained(res) : kept(res)
+          if (res.status >= 400) return explained(res)
+          // what it cost, added to the meter as it goes by
+          return kept(cap === null ? res : metered(res, model, (usd) => spentOn(key, usd)))
         },
       }
     },
@@ -1107,7 +1334,18 @@ export const PostHogAuthPlugin = async ({ client }) => ({
           } catch {}
           return { error: `${why} (HTTP ${res.status})`, signIn: "kept" }
         }
-        return { ...usageOf(await res.json()), signIn: "kept" }
+        const body = await res.json()
+        const key = spendKey(s)
+        noted(key, body?.ai_credits?.used_usd)
+        // the card reads what a request is held at: the meter (the plan's
+        // lagging reading plus this process's own spend) and the ceiling the
+        // plugin enforces, drawn as the window's limit when it is the tighter.
+        // With no meter to read, the plan's own figure stands.
+        const meter = spent.get(key)
+        return {
+          ...usageOf(body, { usedUsd: meter ? usedOf(meter) : undefined, cap: capOf(options) }),
+          signIn: "kept",
+        }
       } catch (e) {
         return { error: e?.message ?? String(e), signIn: "kept" }
       }
@@ -1157,6 +1395,19 @@ export const _internal = {
   modelOf,
   fallbackModels,
   usageOf,
+  capOf,
+  costOf,
+  noted,
+  spentOn,
+  spent,
+  lastUsage,
+  metered,
+  capped,
+  readUsage,
+  usageReads,
+  modelIn,
+  PRICES,
+  remember,
   merged,
   stale,
   refreshed,

@@ -17,7 +17,8 @@ magpie plugin login posthog
 | Gateway | `https://ai-gateway.{us,eu}.posthog.com/v1` — OpenAI chat completions, OpenAI responses, Anthropic messages |
 | Credential | a `phe_` gateway token minted per project at `POST {cloud}/api/projects/{project}/desktop/gateway_token/` |
 | Models | the gateway's `/v1/models`, narrowed to the desktop product's pin and marked by the minted credential's own pin |
-| Allowance | `GET {cloud}/api/projects/{project}/desktop/usage/` — the plan's dollars, on the billing period |
+| Allowance | `GET {cloud}/api/projects/{project}/desktop/usage/` — the plan's credits, on the billing period |
+| Own ceiling | plugin option `maxCredits`, e.g. `magpie plugin options github:Alexiss02/magpie-posthog '{"maxCredits": 1900}'` |
 
 The `posthog_code` product on the older `gateway.{us,eu}.posthog.com` gateway is retired: it
 answers every caller with `product_retired`. PostHog Desktop now mints a short-lived `phe_` token
@@ -116,17 +117,18 @@ window, which is what a client asks for when it is told the window alone.
 
 ## Allowance
 
-`/desktop/usage/` reports the plan's dollar bucket (`ai_credits`, from the organization's billing)
-and two valves, `burst` (daily) and `sustained` (30 days). The card shows the dollars as `Credits`,
-`$used / $limit` with the billing period's end, when billing reports them.
+`/desktop/usage/` reports the plan's dollar bucket (`ai_credits`, from the organization's billing).
+The card reads it in the plan's own unit, **credits** — a credit is a cent, the endpoint's
+`_USD_PER_CREDIT = 0.01`, so a plan whose `limit_usd` is `21` holds 2100 of them and the card says
+`18 / 2100 credits`.
 
-The valves are not drawn, because the backend can't move them: `desktop_access.py` builds both with
-`_exempt_window`, so `used_percent` is `0.0` and `exceeded` false by construction — its own comment
-calls them *"the legacy gateway's usage windows for posthog_code, which its cost throttles exempt"* —
-and the gateway's `_UserCostThrottleBase._is_exempt` returns true for `posthog_code` whatever the
-user. A meter that can only ever read 0% is a meter that lies. The plugin still renders a valve the
-moment one reports movement (`used_percent > 0` or `exceeded`), so a server that starts charging
-there is followed rather than assumed away.
+The valves are not drawn, because the backend can't move them: `desktop_access.py` builds both
+`burst` and `sustained` with `_exempt_window`, so `used_percent` is `0.0` and `exceeded` false by
+construction — its own comment calls them *"the legacy gateway's usage windows for posthog_code,
+which its cost throttles exempt"* — and the gateway's `_UserCostThrottleBase._is_exempt` returns
+true for `posthog_code` whatever the user. A meter that can only ever read 0% is a meter that lies.
+The plugin still renders a valve the moment one reports movement (`used_percent > 0` or
+`exceeded`), so a server that starts charging there is followed rather than assumed away.
 
 Every model bills the same way, `deepseek-ai/deepseek-v4.1-flash-1017-fast` included: `posthog_code`
 declares `credit_bucket=CreditBucket.POSTHOG_CODE_CREDITS` at the product level, and the model is
@@ -134,6 +136,28 @@ pinned to that product (`gateway_model_pin.py`), so there is no per-model choice
 pass-through of the provider's list price — `POSTHOG_CODE_COST_MARKUP_PERCENT = 0.0`.
 
 A 401 or 403 from the usage read marks the account lapsed; every other failure keeps the sign-in.
+
+## A ceiling of your own
+
+`maxCredits` caps what the plan may spend, under its own limit:
+
+```
+magpie plugin options github:Alexiss02/magpie-posthog '{"maxCredits": 1900}'
+```
+
+Past it the plugin refuses every request with a `credit cap is reached` error naming the option, and
+the card reads against 1900 rather than the plan's 2100.
+
+The plan's own reading cannot hold a ceiling by itself: `posthog/tasks/scheduled.py` sends the usage
+report at 03:45 UTC and `ee/billing/quota_limiting.py` reads what it wrote, so `used_usd` lags by up
+to a day and a day's spend would cross the cap before the number moved. So the plugin meters the
+calls it makes itself: each reply's `usage` is priced at the gateway's own per-token figures
+(`/v1/models`' `pricing`, cached tokens at `cache_read`) and added to the plan's last reading. The
+reading is asked for at most once every five minutes, and a reading that catches up with the local
+spend is not counted twice.
+
+Nothing is buffered for this: an unstreamed reply is read beside the caller, and a streamed one is
+scanned as it goes by, its cost taken from the last chunk that carries `usage`.
 
 ## Refusals
 
