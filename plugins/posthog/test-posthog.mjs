@@ -276,6 +276,11 @@ assert.equal(I.costOf("zai-org/glm-5.2", { prompt_tokens: 1000, prompt_tokens_de
 // the Messages API reports the cached tokens beside the input, not inside it:
 // 100 × 5e-6 + 900 × 5e-7 + 10 × 2.5e-5
 assert.equal(I.costOf("claude-opus-5", { input_tokens: 100, cache_read_input_tokens: 900, output_tokens: 10 }).toFixed(9), "0.001200000")
+// the Responses API counts the cache inside input_tokens, as chat completions
+// counts it inside prompt_tokens: 41 fresh + 6272 cached + 32 out on gpt-5
+assert.equal(I.costOf("gpt-5", { input_tokens: 6313, input_tokens_details: { cached_tokens: 6272 }, output_tokens: 32 }).toFixed(9), "0.001155250")
+// counting the cache twice would bill this as $0.0090 instead
+assert.notEqual(I.costOf("gpt-5", { input_tokens: 6313, input_tokens_details: { cached_tokens: 6272 }, output_tokens: 32 }).toFixed(9), "0.008995250")
 // a cache write is priced above a plain prompt token, and at the prompt's own price when unquoted
 assert.equal(I.costOf("claude-opus-5", { input_tokens: 0, cache_creation_input_tokens: 1000, output_tokens: 0 }).toFixed(9), "0.006250000")
 // a model nothing prices costs nothing rather than NaN

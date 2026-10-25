@@ -156,6 +156,19 @@ calls it makes itself: each reply's `usage` is priced at the gateway's own per-t
 reading is asked for at most once every five minutes, and a reading that catches up with the local
 spend is not counted twice.
 
+The three shapes the gateway serves disagree about where the cache sits, and the pricing reads each
+on its own terms:
+
+| shape | prompt count | cached | where the cache sits |
+|---|---|---|---|
+| chat completions | `prompt_tokens` | `prompt_tokens_details.cached_tokens` | **inside** the count |
+| Responses | `input_tokens` | `input_tokens_details.cached_tokens` | **inside** the count |
+| Messages | `input_tokens` | `cache_read_input_tokens` | **beside** the count |
+
+An inside figure is taken back out before the fresh tokens are priced. Counting it twice is not a
+rounding error: `gpt-5` at 6313 input of which 6272 cached is $0.00116, and the double count would
+bill $0.00900.
+
 Nothing is buffered for this: an unstreamed reply is read beside the caller, and a streamed one is
 scanned as it goes by, its cost taken from the last chunk that carries `usage`.
 

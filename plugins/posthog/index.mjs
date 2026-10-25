@@ -805,21 +805,39 @@ const PRICES = new Map(
 const remember = (m) =>
   PRICES.set(String(m.id).toLowerCase(), { input: m.input, output: m.output, read: m.read, write: m.write })
 
-// costOf is one reply's cost in dollars, from the usage it reports: the prompt's
-// uncached and cached parts at their own prices, the completion's at its. Both
-// shapes are read: chat completions counts the cached tokens inside
-// prompt_tokens, the Messages API reports them beside input_tokens.
+// costOf is one reply's cost in dollars, from the usage it reports. Three shapes
+// report it, and they disagree about where the cache sits:
+//
+//   chat completions  prompt_tokens, with prompt_tokens_details.cached_tokens
+//                     and .cache_write_tokens counted INSIDE it
+//   Responses         input_tokens, with input_tokens_details.cached_tokens and
+//                     .cache_write_tokens counted INSIDE it
+//   Messages          input_tokens, with cache_read_input_tokens and
+//                     cache_creation_input_tokens reported BESIDE it
+//
+// So a `*_details` figure is a part of its own count and is taken back out before
+// the fresh tokens are priced; a `cache_*_input_tokens` sibling is not. Getting
+// this wrong double-charges: 6313 input of which 6272 cached is $0.00123 on
+// gpt-5, not the $0.00868 a cache counted twice would bill.
 function costOf(id, u) {
   const p = PRICES.get(String(id ?? "").toLowerCase())
   if (!p || !u) return 0
+  const details = u.prompt_tokens_details ?? u.input_tokens_details ?? null
+  const insideCached = Number(details?.cached_tokens) || 0
+  const insideWritten = Number(details?.cache_write_tokens) || 0
+  const besideCached = Number(u.cache_read_input_tokens) || 0
+  const besideWritten = Number(u.cache_creation_input_tokens) || 0
   const prompt = Number(u.prompt_tokens ?? u.input_tokens) || 0
-  const cached = Number(u.prompt_tokens_details?.cached_tokens ?? u.cache_read_input_tokens) || 0
-  const written = Number(u.cache_creation_input_tokens) || 0
   const output = Number(u.completion_tokens ?? u.output_tokens) || 0
-  const fresh = u.prompt_tokens === undefined ? prompt : Math.max(0, prompt - cached)
+  const fresh = Math.max(0, prompt - insideCached - insideWritten)
   // a cache write costs more than a plain prompt token; where the gateway quotes
   // no write price, the prompt's own is the floor
-  return fresh * p.input + cached * p.read + written * (p.write || p.input) + output * p.output
+  return (
+    fresh * p.input +
+    (insideCached + besideCached) * p.read +
+    (insideWritten + besideWritten) * (p.write || p.input) +
+    output * p.output
+  )
 }
 
 // spent is each project's plan as this process knows it: the dollars the usage
