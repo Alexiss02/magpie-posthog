@@ -2,16 +2,25 @@
 //
 // A PostHog account signs in in the browser (PostHog's own /oauth/authorize,
 // PKCE S256, a loopback callback), or is taken as an OAuth access token pasted
-// in. Its chats are OpenAI-compatible chat completions at the LLM gateway's
-// product route, https://gateway.{us|eu}.posthog.com/posthog_code/v1, streamed
-// or not, with the account's `pha_` access token as the bearer.
+// in. Chats then go to PostHog's AI gateway, https://ai-gateway.{us|eu}.posthog.com,
+// which is what PostHog Desktop itself calls since the legacy
+// gateway.{us|eu}.posthog.com/posthog_code product was retired: that product
+// answers every caller with `product_retired` now.
 //
-// The client id is PostHog Desktop's own (PostHog Code), which is the only
-// thing the gateway's `posthog_code` product accepts: its OAuth application
-// allowlist names the three Desktop apps, and that app's scope ceiling is
-// `@default` plus the privileged `llm_gateway:read` the gateway requires.
-// Asking for that scope alone is enough — the server clamps the request to the
-// ceiling and grants identity scopes with it.
+// The gateway takes neither the account's `pha_` OAuth token (401 auth_failed)
+// nor a personal API key. It takes a `phe_` gateway token, minted per project at
+// POST {cloud}/api/projects/{project}/desktop/gateway_token/ with the account's
+// `pha_` token. The mint answers the token's lifetime (300 s by default), the
+// gateway URL, the plan, the models the credential may call, and the product's
+// own model list. So this plugin holds the account's OAuth sign-in, mints a
+// gateway token when it needs one, and speaks OpenAI chat completions or
+// Anthropic messages to the gateway per model — whichever shapes the gateway
+// lists for that model.
+//
+// The client id is PostHog Desktop's own (PostHog Code), which is what the mint
+// checks: its OAuth application allowlist names the three Desktop apps, and that
+// app's scope ceiling is `@default` plus the privileged `llm_gateway:read` the
+// mint requires.
 //
 // The Desktop app's own sign-in lives in an AES-256-GCM blob keyed to the
 // machine id, which this plugin does not read: sign in here instead, or paste
@@ -20,32 +29,37 @@
 import { createHash, randomBytes } from "node:crypto"
 import { createServer } from "node:http"
 
-const NPM = "@ai-sdk/openai-compatible"
-const PRODUCT = "posthog_code"
-// billing:read is granted on ask (the app's ceiling allows it): it reads the
-// plan and the coding plan's credit bucket at the cloud's /api/billing/
-const SCOPES = "openid profile email llm_gateway:read billing:read"
+const NPM_CHAT = "@ai-sdk/openai-compatible"
+const NPM_MESSAGES = "@ai-sdk/anthropic"
+// llm_gateway:read is the raw scope the mint checks; identity scopes come with
+// it. billing:read is not needed: /desktop/usage/ carries the plan's dollars.
+const SCOPES = "openid profile email llm_gateway:read"
 const CALLBACK_TIMEOUT_MS = 5 * 60 * 1000
 const EARLY_MS = 60 * 1000 // a token this close to its end is refreshed before a request
 const LEAD_MS = 5 * 60 * 1000 // and this close, magpie renews it ahead of time (auth.refresh)
 const KEEP_RENEWED_MS = 60 * 1000 // how long a refresh's result answers for the old refresh token
+// The minted gateway token's own renewal: a tenth of its lifetime before the
+// end, clamped as Desktop's GatewayTokenService clamps it.
+const MINT_MIN_SKEW_MS = 30 * 1000
+const MINT_MAX_SKEW_MS = 2 * 60 * 1000
+const MINT_MIN_INTERVAL_MS = 5 * 1000 // no second mint inside this, whatever the reason
 const ICON = "https://github.com/PostHog.png?size=96"
 
 // PostHog Cloud's two regions, each with the Desktop app's client id (a public
-// client: PKCE, no secret) and the gateway that serves its coding plan.
+// client: PKCE, no secret) and the AI gateway that serves its coding plan.
 const REGIONS = {
   us: {
     id: "us",
     name: "US",
     cloud: "https://us.posthog.com",
-    gateway: "https://gateway.us.posthog.com",
+    gateway: "https://ai-gateway.us.posthog.com",
     clientId: "HCWoE0aRFMYxIxFNTTwkOORn5LBjOt2GVDzwSw5W",
   },
   eu: {
     id: "eu",
     name: "EU",
     cloud: "https://eu.posthog.com",
-    gateway: "https://gateway.eu.posthog.com",
+    gateway: "https://ai-gateway.eu.posthog.com",
     clientId: "AIvijgMS0dxKEmr5z6odvRd8Pkh5vts3nPTzgzU9",
   },
 }
@@ -75,57 +89,72 @@ const CALLBACK_PORTS = [8237, 8239]
 const redirectFor = (port) => `http://localhost:${port}/callback`
 
 const regionOf = (a) => REGIONS[a?.region] ?? REGIONS[a?.metadata?.region] ?? REGIONS.us
-const api = (r) => `${r.gateway}/${PRODUCT}/v1`
-const usageUrl = (r) => `${r.gateway}/v1/usage/${PRODUCT}`
-const modelsUrl = (r) => `${r.gateway}/${PRODUCT}/v1/models`
-const billingUrl = (r) => `${r.cloud}/api/billing/`
+const api = (r) => `${r.gateway}/v1`
+const modelsUrl = (r) => `${r.gateway}/v1/models`
+// the project the account is scoped to, else the account's current one
+const projectOf = (a) => a?.project ?? "@current"
+const mintUrl = (r, project) => `${r.cloud}/api/projects/${project}/desktop/gateway_token/`
+const usageUrl = (r, project) => `${r.cloud}/api/projects/${project}/desktop/usage/`
 
 // ---- the plan's models -------------------------------------------------------
 
-// The gateway's own catalogue, as a fallback for a signed-out account or a list
-// the gateway won't give: [id, context, vision, reasoning levels, prompt,
-// completion, cache read, cache write], prices per token.
-const FALLBACK = [
-  ["claude-sonnet-4-6", 1000000, true, "0.000003", "0.000015", "0.0000003", "0.00000375"],
-  ["claude-sonnet-5", 1000000, true, "0.000002", "0.00001", "0.0000002", "0.0000025"],
-  ["claude-sonnet-5-5", 1000000, true, "0.000002", "0.00001", "0.0000002", "0.0000025"],
-  ["claude-opus-4-7", 1000000, true, "0.000005", "0.000025", "0.0000005", "0.00000625"],
-  ["claude-opus-4-8", 1000000, true, "0.000005", "0.000025", "0.0000005", "0.00000625"],
-  ["claude-opus-5", 1000000, true, "0.000005", "0.000025", "0.0000005", "0.00000625"],
-  ["claude-opus-5-5", 1000000, true, "0.000004", "0.00002", "0.0000004", "0.000005"],
-  ["claude-fable-5", 1000000, true, "0.00001", "0.00005", "0.000001", "0.0000125"],
-  ["claude-fable-5-1", 1000000, true, "0.00001", "0.00005", "0.000001", "0.0000125"],
-  ["gpt-5.4", 1050000, true, "0.0000025", "0.000015", "0.00000025", "0.0000025"],
-  ["gpt-5.5", 1050000, true, "0.000005", "0.00003", "0.0000005", "0.000005"],
-  ["gpt-5.6-luna", 922000, true, "0.0000002", "0.0000012", "0.00000002", "0.0000002"],
-  ["gpt-5.6-sol", 922000, true, "0.000004", "0.00002", "0.0000004", "0.000004"],
-  ["gpt-5.6-terra", 922000, true, "0.000002", "0.000012", "0.0000002", "0.000002"],
-  ["gpt-6-astra", 922000, true, "0.00001", "0.00005", "0.000001", "0.0000125"],
-  ["gpt-6-luna", 922000, true, "0.0000001", "0.0000005", "0.00000001", "0.0000001"],
-  ["gpt-6-sol", 922000, true, "0.000002", "0.00001", "0.0000002", "0.0000025"],
-  ["gpt-6.1-sol", 922000, true, "0.000002", "0.00001", "0.0000002", "0.0000025"],
-  ["@cf/zai-org/glm-5.2", 128000, false, "0.0000014", "0.0000044", "0.00000014", "0.0000014"],
-  ["zai-org/glm-5.3", 1048576, false, "0.0000014", "0.0000044", "0.00000014", "0.0000014"],
-  ["zai-org/glm-5.3-flash", 1000000, false, "0.00000015", "0.0000005", "0.000000015", "0.00000015"],
-  ["moonshotai/kimi-k3", 262144, false, "0.000003", "0.000015", "0.0000003", "0.000003"],
-  ["deepseek-ai/deepseek-v4-flash-0731", 1048000, false, "0.00000013", "0.00000026", "0.000000013", "0.00000013"],
+// What the desktop product lists, as products/tasks/backend/logic/services/
+// gateway_model_pin.py pins it: the account's own sign-in adds the SDK's
+// implicit models and the legacy ids older app builds call. A list the mint
+// doesn't give (a signed-out account) falls back to this.
+const PRODUCT_MODELS = [
+  "claude-haiku-4-5",
+  "claude-sonnet-4-5",
+  "@cf/zai-org/glm-5.2",
+  "zai-org/glm-5.2",
+  "zai-org/glm-5.3",
+  "zai-org/glm-5.3-flash",
+  "moonshotai/kimi-k3",
+  "deepseek-ai/deepseek-v4-flash-0731",
+  "deepseek-ai/deepseek-v4.1-flash-1017-fast",
+  "claude-opus-4-5",
+  "claude-opus-4-6",
+  "claude-opus-4-7",
+  "claude-opus-4-8",
+  "claude-opus-5",
+  "claude-opus-5-5",
+  "claude-fable-5",
+  "claude-fable-5-1",
+  "claude-sonnet-5-5",
+  "claude-sonnet-5",
+  "claude-sonnet-4-6",
+  "gpt-5",
+  "gpt-5.5",
+  "gpt-5.6-sol",
+  "gpt-5.6-terra",
+  "gpt-5.6-luna",
+  "gpt-6-astra",
+  "gpt-6-sol",
+  "gpt-6.1-sol",
+  "gpt-6-luna",
+  "gpt-5.4",
+  "gpt-5.3-codex",
+  "gpt-5.2",
+  "gpt-5-mini",
 ]
 
 // What the plan serves without a paid subscription (the gateway's
-// posthog_code_free_tier_models): the free marks a signed-out list carries,
-// and an org the gateway allows everything keeps. Signed in, the gateway's
-// own per-org marks are what count (allowed/restriction_reason, below).
+// posthog_code_free_tier_models): the free marks a signed-out list carries, and
+// the models a free-plan credential may call. The gateway serves GLM 5.2 twice,
+// under `@cf/` and bare, and the Go gateway answers the bare id.
 const FREE_TIER = new Set([
   "@cf/zai-org/glm-5.2",
+  "zai-org/glm-5.2",
   "deepseek-ai/deepseek-v4-flash-0731",
   "moonshotai/kimi-k3",
   "zai-org/glm-5.3-flash",
 ])
-const FREE_TIER_LIST = [...FREE_TIER].join(", ")
+const FREE_TIER_LIST = [...new Set([...FREE_TIER].map((id) => id.replace(/^@cf\//, "")))].join(", ")
 
 // The models PostHog's own app never lists, whatever the gateway still serves
 // (Desktop's BLOCKED_GATEWAY_MODEL_IDS): older models it keeps out of its
-// picker, with and without their vendor prefixes.
+// picker, with and without their vendor prefixes. The product pin leaves most
+// of them out already; this keeps a gateway that lists them from offering them.
 const BLOCKED = new Set([
   "gpt-5-mini",
   "openai/gpt-5-mini",
@@ -145,69 +174,77 @@ const BLOCKED = new Set([
   "anthropic/claude-haiku-4-5",
 ])
 
-// What PostHog's own picker calls each model (its model catalog, resolved to a
-// label); the gateway's display_name is the raw id, which reads badly beside
-// the FREE badge and the plan's other rows.
+// The gateway's own catalogue, as a fallback for a signed-out account or a list
+// the gateway won't give: [id, context, prompt, completion, cache read, cache
+// write], prices per token, as https://ai-gateway.{us,eu}.posthog.com/v1/models
+// quotes them.
+const FALLBACK = [
+  ["claude-fable-5", 1000000, "0.00001", "0.00005", "0.000001", "0.0000125"],
+  ["claude-fable-5-1", 1000000, "0.00001", "0.00005", "0.00000025", "0.0000125"],
+  ["claude-opus-4-7", 1000000, "0.000005", "0.000025", "0.0000005", "0.00000625"],
+  ["claude-opus-4-8", 1000000, "0.000005", "0.000025", "0.0000005", "0.00000625"],
+  ["claude-opus-5", 1000000, "0.000005", "0.000025", "0.0000005", "0.00000625"],
+  ["claude-opus-5-5", 1000000, "0.000004", "0.00002", "0.0000002", "0.000005"],
+  ["claude-sonnet-4-6", 1000000, "0.000003", "0.000015", "0.0000003", "0.00000375"],
+  ["claude-sonnet-5", 1000000, "0.000002", "0.00001", "0.0000002", "0.0000025"],
+  ["claude-sonnet-5-5", 1000000, "0.000002", "0.00001", "0.0000001", "0.0000025"],
+  ["gpt-5", 400000, "0.00000125", "0.00001", "0.000000125", null],
+  ["gpt-5.4", 1050000, "0.0000025", "0.000015", "0.00000025", null],
+  ["gpt-5.5", 1050000, "0.000005", "0.00003", "0.0000005", null],
+  ["gpt-5.6-luna", 1050000, "0.0000002", "0.0000012", "0.00000002", "0.00000025"],
+  ["gpt-5.6-sol", 1050000, "0.000004", "0.00002", "0.0000004", "0.000005"],
+  ["gpt-5.6-terra", 1050000, "0.000002", "0.000012", "0.0000002", "0.0000025"],
+  ["gpt-6-astra", 1050000, "0.00001", "0.00005", "0.000001", "0.0000125"],
+  ["gpt-6-luna", 1050000, "0.0000001", "0.0000005", "0.00000001", "0.000000125"],
+  ["gpt-6-sol", 1050000, "0.000002", "0.00001", "0.0000002", "0.0000025"],
+  ["gpt-6.1-sol", 1050000, "0.000002", "0.00001", "0.0000001", "0.0000025"],
+  ["zai-org/glm-5.2", 262144, "0.0000014", "0.0000044", "0.00000026", null],
+  ["zai-org/glm-5.3", 1000000, "0.0000014", "0.0000044", "0.00000014", null],
+  ["zai-org/glm-5.3-flash", 1000000, "0.00000015", "0.0000005", "0.00000003", null],
+  ["moonshotai/kimi-k3", 1048576, "0.000003", "0.000015", "0.0000003", null],
+  ["deepseek-ai/deepseek-v4-flash-0731", 1048000, "0.00000013", "0.00000026", "0.000000028", null],
+  ["deepseek-ai/deepseek-v4.1-flash-1017-fast", 1048000, "0.0000006", "0.0000024", "0.000000014", null],
+]
+
+// What PostHog's own picker calls each model (its model catalog's labels); the
+// gateway names most of them itself, and the open-weight ones it leaves bare.
 const NAMES = {
-  "claude-sonnet-4-6": "Claude Sonnet 4.6",
-  "claude-sonnet-5": "Claude Sonnet 5",
-  "claude-sonnet-5-5": "Claude Sonnet 5.5",
-  "claude-opus-4-7": "Claude Opus 4.7",
-  "claude-opus-4-8": "Claude Opus 4.8",
-  "claude-opus-5": "Claude Opus 5",
-  "claude-opus-5-5": "Claude Opus 5.5",
-  "claude-fable-5": "Claude Fable 5",
-  "claude-fable-5-1": "Claude Fable 5.1",
-  "gpt-5.4": "GPT-5.4",
-  "gpt-5.5": "GPT-5.5",
-  "gpt-5.6-luna": "GPT-5.6 Luna",
-  "gpt-5.6-sol": "GPT-5.6 Sol",
-  "gpt-5.6-terra": "GPT-5.6 Terra",
-  "gpt-6-astra": "GPT-6 Astra",
-  "gpt-6-luna": "GPT-6 Luna",
-  "gpt-6-sol": "GPT-6 Sol",
-  "gpt-6.1-sol": "GPT-6.1 Sol",
   "@cf/zai-org/glm-5.2": "GLM-5.2",
+  "zai-org/glm-5.2": "GLM-5.2",
   "zai-org/glm-5.3": "GLM-5.3",
   "zai-org/glm-5.3-flash": "GLM-5.3 Flash",
   "moonshotai/kimi-k3": "Kimi K3",
-  "deepseek-ai/deepseek-v4-flash-0731": "DeepSeek V4 Flash 0731",
+  "deepseek-ai/deepseek-v4-flash-0731": "DeepSeek V4 Flash",
+  "deepseek-ai/deepseek-v4.1-flash-1017-fast": "DeepSeek V4.1 Flash Fast",
+  "gpt-5": "GPT-5",
 }
 
-// nameOf is the plan's own name for a model, the gateway's when it has a better
-// one than the id, the id otherwise.
+// nameOf is the plan's own name for a model, the gateway's when it has one, the
+// id otherwise.
 const nameOf = (id, given) => NAMES[id] ?? (given && given !== id ? given : id)
 
 // ---- reasoning levels --------------------------------------------------------
 
-// The gateway's model list carries no reasoning levels at all (its
-// supported_reasoning_levels is empty for every model it serves), so the depths
-// come from PostHog's own model catalog — the same data its Desktop picker draws
-// its effort dropdown from. The ladders are its, verbatim:
+// The gateway takes these (anything else is a 400: "Input should be 'minimal',
+// 'low', 'medium', 'high', 'xhigh', 'max' or 'none'"), and Desktop's catalog
+// gives each model its ladder. `ultracode` is Desktop's own top rung and is not
+// a gateway value, so it is left off every ladder here.
 const STANDARD = ["low", "medium", "high"]
 const THROUGH_MAX = [...STANDARD, "xhigh", "max"]
-const EXTENDED = [...THROUGH_MAX, "ultracode"]
-// GLM exposes two thinking depths rather than the whole ladder.
 const GLM = ["high", "max"]
 
-// What each of the gateway's models takes, by id.
 const EFFORTS = {
-  "@cf/zai-org/glm-5.2": GLM,
-  "zai-org/glm-5.3": GLM,
-  "zai-org/glm-5.3-flash": GLM,
-  "moonshotai/kimi-k3": [],
-  "deepseek-ai/deepseek-v4-flash-0731": [],
   "claude-opus-4-5": STANDARD,
   "claude-opus-4-6": THROUGH_MAX,
-  "claude-opus-4-7": EXTENDED,
-  "claude-opus-4-8": EXTENDED,
-  "claude-opus-5": EXTENDED,
-  "claude-opus-5-5": EXTENDED,
-  "claude-fable-5": EXTENDED,
-  "claude-fable-5-1": EXTENDED,
-  "claude-sonnet-5-5": EXTENDED,
-  "claude-sonnet-5": EXTENDED,
+  "claude-opus-4-7": THROUGH_MAX,
+  "claude-opus-4-8": THROUGH_MAX,
+  "claude-opus-5": THROUGH_MAX,
+  "claude-opus-5-5": THROUGH_MAX,
+  "claude-fable-5": THROUGH_MAX,
+  "claude-fable-5-1": THROUGH_MAX,
   "claude-sonnet-4-6": STANDARD,
+  "claude-sonnet-5": THROUGH_MAX,
+  "claude-sonnet-5-5": THROUGH_MAX,
   "gpt-5": STANDARD,
   "gpt-5.5": [...STANDARD, "xhigh"],
   "gpt-5.6-sol": THROUGH_MAX,
@@ -217,6 +254,13 @@ const EFFORTS = {
   "gpt-6-sol": THROUGH_MAX,
   "gpt-6.1-sol": THROUGH_MAX,
   "gpt-6-luna": THROUGH_MAX,
+  "zai-org/glm-5.2": GLM,
+  "@cf/zai-org/glm-5.2": GLM,
+  "zai-org/glm-5.3": GLM,
+  "zai-org/glm-5.3-flash": GLM,
+  "moonshotai/kimi-k3": [],
+  "deepseek-ai/deepseek-v4-flash-0731": [],
+  "deepseek-ai/deepseek-v4.1-flash-1017-fast": [],
 }
 
 // A whole family's depths, for a variant the gateway lists and the catalog
@@ -244,19 +288,38 @@ function levelsOf(id) {
   return id.startsWith("gpt-") ? STANDARD : []
 }
 
+// ---- which shape a model is spoken to with -----------------------------------
+
+// The gateway lists each model's api_shapes. Claude models are served on
+// Anthropic's Messages API only, so magpie must speak that to them; the
+// open-weight and OpenAI models answer chat completions. A model the listing
+// gives no shapes for is spoken to with what its family is served on: the
+// Messages API for Claude, chat completions for the rest.
+const shapesOf = (m) => (Array.isArray(m?.api_shapes) ? m.api_shapes : [])
+const defaultShapes = (id) => (/^claude/.test(id) ? ["anthropic-messages"] : ["openai-chat-completions"])
+
+function npmOf(id, shapes) {
+  const s = shapes.length ? shapes : defaultShapes(id)
+  if (s.includes("openai-chat-completions")) return NPM_CHAT
+  if (s.includes("anthropic-messages")) return NPM_MESSAGES
+  return null // a shape magpie can't speak (gemini, systemone)
+}
+
+// visionOf: the models that take images. The gateway's listing carries no
+// vision flag, so it comes from the family.
+const visionOf = (id) => /^(claude|gpt|gemini)/.test(id)
+
 // ---- reply limits ------------------------------------------------------------
 
-// The most a reply may hold, where the vendor caps it below the model's window.
-// The gateway's model list carries only a context window, and magpie fills an
-// absent output from models.dev — whose figure for DeepSeek V4 Flash (384000)
-// is above the 262144 its backend takes, so a client told 384000 asks for more
-// than the gateway accepts and every request 400s. The rest take their window,
-// which is what a client asks for when it is told the window alone.
-const OUTPUTS = { "deepseek-ai/deepseek-v4-flash-0731": 262144 }
+// The most a reply may hold. The gateway's window is the room a prompt and its
+// reply share, and Kimi's backend rejects a sum over it, so a reply sized to the
+// whole window 400s once a prompt is in it; half the window is what Kimi takes.
+// Every other model takes its window, which is what a client asks for when it is
+// told the window alone.
+const OUTPUTS = { "moonshotai/kimi-k3": 524288 }
 
 // outputOf is a model's reply limit as a client is told it: the cap above, its
-// window otherwise, never more than the window (which would size a reply past
-// the room its prompt left).
+// window otherwise, never more than the window.
 const outputOf = (id, context) => {
   const cap = OUTPUTS[id] ?? context ?? 0
   return context > 0 && cap > context ? context : cap
@@ -273,11 +336,12 @@ function variants(levels) {
 
 function modelOf(provider, region, m) {
   const levels = m.levels ?? []
+  const npm = m.npm ?? NPM_CHAT
   return {
     id: m.id,
     providerID: provider.id,
     name: m.name,
-    api: { id: m.id, url: api(region), npm: NPM },
+    api: { id: m.id, url: api(region), npm },
     status: "active",
     headers: {},
     options: {},
@@ -294,66 +358,64 @@ function modelOf(provider, region, m) {
     },
     release_date: "",
     variants: variants(levels),
-    // magpie's own: served at no cost to the plan's credits — the org's own
-    // mark when the gateway gave one (models(), below), the plan's free set
-    // otherwise
+    // magpie's own: served at no cost to the plan's allowance — the free tier's
+    // models, which need no paid plan; the account's own mark when the mint gave
+    // one (models(), below)
     free: m.free ?? FREE_TIER.has(m.id),
     rate: 0,
   }
 }
 
 const fallbackModels = (provider, region) =>
-  Object.fromEntries(FALLBACK.map(([id, context, vision, prompt, completion, read, write]) => [
-    id,
-    modelOf(provider, region, {
+  Object.fromEntries(
+    FALLBACK.filter(([id]) => !BLOCKED.has(id)).map(([id, context, prompt, completion, read, write]) => [
       id,
-      name: nameOf(id),
-      context,
-      vision,
-      levels: levelsOf(id),
-      input: price(prompt),
-      output: price(completion),
-      read: price(read),
-      write: price(write),
-    }),
-  ]))
+      modelOf(provider, region, {
+        id,
+        name: nameOf(id),
+        context,
+        vision: visionOf(id),
+        levels: levelsOf(id),
+        npm: npmOf(id, []),
+        input: price(prompt),
+        output: price(completion),
+        read: price(read),
+        write: price(write),
+      }),
+    ]),
+  )
 
 // own is the list the provider was given, else the one above: the host passes
-// the provider the config hook built, and a caller that passes a bare one
-// still gets the plan's models.
+// the provider the config hook built, and a caller that passes a bare one still
+// gets the plan's models.
 const own = (provider, region) =>
   provider?.models && Object.keys(provider.models).length ? provider.models : fallbackModels(provider, region)
 
-// A gateway model object (ModelObject) as the plugin's own shape. Its prices
-// are strings of dollars per token. The gateway answers with no reasoning
-// levels, so the catalog's fill in — and would win over it if it ever did.
+// A gateway model object as the plugin's own shape. Its prices are strings of
+// dollars per token; its api_shapes say which API it is served on.
 function fromGateway(id, m) {
-  const said = Array.isArray(m.supported_reasoning_levels) ? m.supported_reasoning_levels.filter(Boolean) : []
+  const shapes = shapesOf(m)
   return {
     id,
-    name: nameOf(id, m.display_name || m.slug),
+    name: nameOf(id, m.name || m.display_name || m.slug),
     context: Number(m.context_window) || 0,
-    vision: m.supports_vision === true,
-    levels: said.length ? said : levelsOf(id),
+    vision: visionOf(id),
+    levels: levelsOf(id),
+    npm: npmOf(id, shapes),
+    shapes,
     input: price(m.pricing?.prompt),
     output: price(m.pricing?.completion),
-    read: price(m.pricing?.input_cache_read),
-    write: price(m.pricing?.input_cache_write),
-    // the org's own marks, as Desktop reads them: what this account may use,
-    // and why not, when the gateway says no
-    allowed: m.allowed !== false,
-    reason: m.restriction_reason ?? null,
+    read: price(m.pricing?.cache_read ?? m.pricing?.input_cache_read),
+    write: price(m.pricing?.cache_write ?? m.pricing?.input_cache_write),
   }
 }
 
 // ---- the sign-in -------------------------------------------------------------
 
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
-
 // listen binds one of the registered callback ports for the sign-in, whose
-// redirect the authorization server then accepts (CALLBACK_PORTS above). No
-// host is given, so the server takes both the ::1 and the 127.0.0.1 a browser
-// may resolve localhost to.
+// redirect the authorization server then accepts (CALLBACK_PORTS above). No host
+// is given, so the server takes both the ::1 and the 127.0.0.1 a browser may
+// resolve localhost to.
 async function listen() {
   let lastErr
   for (const port of CALLBACK_PORTS) {
@@ -409,8 +471,8 @@ function saved(region, env, extra = {}) {
     access: env.access_token,
     expires: Date.now() + (Number(env.expires_in) || 0) * 1000,
     region: region.id,
-    // a token scoped to one project names it, so the gateway can be asked for
-    // that project's Desktop access rather than the account's current one
+    // a token scoped to one project names it, so the mint and the usage read
+    // ask for that project rather than the account's current one
     ...(teams.length === 1 ? { project: teams[0] } : {}),
     accountId: who(env, region),
     ...extra,
@@ -418,8 +480,8 @@ function saved(region, env, extra = {}) {
 }
 
 // who is the account's own name for itself, when the token says: PostHog's
-// OAuth tokens name scoped organizations and teams, not people, so the region
-// is what the row shows until the user names it.
+// OAuth tokens name scoped organizations and teams, not people, so the region is
+// what the row shows until the user names it.
 const who = (env, region) => {
   const orgs = Array.isArray(env.scoped_organizations) ? env.scoped_organizations.length : 0
   const teams = Array.isArray(env.scoped_teams) ? env.scoped_teams.length : 0
@@ -471,8 +533,8 @@ async function browserSignIn(inputs) {
   url.searchParams.set("code_challenge_method", "S256")
   url.searchParams.set("scope", SCOPES)
   url.searchParams.set("state", state)
-  // as the Desktop app asks: the consent picks a project, and the gateway
-  // authorizes a request against the project its token names
+  // as the Desktop app asks: the consent picks a project, and the mint
+  // authorizes against the project its token names
   url.searchParams.set("required_access_level", "project")
 
   return {
@@ -500,11 +562,11 @@ async function browserSignIn(inputs) {
   }
 }
 
-// ---- renewing ----------------------------------------------------------------
+// ---- renewing the account's own token ----------------------------------------
 
-// renewing is each refresh under way, by region and the refresh token it
-// spends; renewed is what each gave, kept a minute so one that read the old
-// refresh token after it was spent takes that rather than spending it again.
+// renewing is each refresh under way, by region and the refresh token it spends;
+// renewed is what each gave, kept a minute so one that read the old refresh token
+// after it was spent takes that rather than spending it again.
 const renewing = new Map()
 const renewed = new Map()
 
@@ -539,8 +601,8 @@ function merged(a, next) {
 }
 
 // fresh is the sign-in with an access token that isn't about to end: refreshed
-// (and saved) when it is. A refresh that fails leaves the access token there
-// is, for the vendor's answer to tell.
+// (and saved) when it is. A refresh that fails leaves the access token there is,
+// for the vendor's answer to tell.
 async function fresh(client, a) {
   if (!stale(a)) return a
   if (!refreshable(a)) return a
@@ -566,13 +628,14 @@ async function refreshed(auth) {
   return Object.keys(out).length ? out : undefined
 }
 
-// bearerOf is the token a request carries: the stored one, or a pasted `pha_`
-// access token (an "api" sign-in).
+// bearerOf is the account's own token: the stored one, or a pasted `pha_` access
+// token (an "api" sign-in). It is what the mint is called with, never what the
+// gateway takes.
 const bearerOf = (a) => (a?.type === "api" ? a.key ?? "" : a?.access ?? "")
 
-// signedIn is what every read of the gateway starts from: the account with a
-// bearer that isn't about to end (refreshed when it was), or null when nothing
-// is signed in. getAuth may be the stored account or the host's reader of it.
+// signedIn is what every read starts from: the account with a bearer that isn't
+// about to end (refreshed when it was), or null when nothing is signed in.
+// getAuth may be the stored account or the host's reader of it.
 async function signedIn(client, getAuth) {
   const auth = typeof getAuth === "function" ? await getAuth() : getAuth
   if (!auth || (!auth.access && !auth.key)) return null
@@ -581,66 +644,161 @@ async function signedIn(client, getAuth) {
   return bearer ? { auth: a, region: regionOf(a), bearer } : null
 }
 
+// ---- the gateway token -------------------------------------------------------
+
+// The mint's answer, as this plugin holds it.
+function gatewayToken(region, env) {
+  const expiresAt = Date.parse(env?.expires_at ?? "")
+  return {
+    token: env?.token ?? "",
+    gateway: String(env?.gateway_url ?? region.gateway).replace(/\/+$/, "").replace(/\/v1$/, ""),
+    expiresAt: Number.isFinite(expiresAt) ? expiresAt : Date.now() + 300_000,
+    plan: env?.plan === "paid" ? "paid" : "free",
+    allowed: Array.isArray(env?.allowed_models) ? env.allowed_models : null,
+    product: Array.isArray(env?.product_models) && env.product_models.length ? env.product_models : PRODUCT_MODELS,
+    capUsd: env?.cap_usd ?? null,
+  }
+}
+
+// minted is each project's gateway token, and the mint under way for it: the
+// mint is throttled per user (120 an hour), so one is never started while
+// another is, and a token still good is kept.
+const minted = new Map()
+
+// mint asks Django for a gateway token for the account's project, as Desktop's
+// GatewayTokenService does. Any non-201 is a refusal, and its `reason` says
+// which — the same reasons Desktop's card explains.
+async function mint(region, project, bearer) {
+  const res = await fetch(mintUrl(region, project), {
+    method: "POST",
+    headers: { Authorization: `Bearer ${bearer}`, "Content-Type": "application/json", Accept: "application/json" },
+    body: "{}",
+    signal: AbortSignal.timeout(15000),
+  })
+  const text = await res.text()
+  let env = {}
+  try {
+    env = JSON.parse(text) ?? {}
+  } catch {}
+  if (res.status !== 201 || !env.token) {
+    const reason = env.reason || env.code || `http_${res.status}`
+    const why = env.detail || env.error || text.trim().slice(0, 200) || res.statusText
+    throw refusal(reason, why, res.status, env.access)
+  }
+  return gatewayToken(region, env)
+}
+
+// refusal is a mint that said no, carrying what the card can say about it.
+function refusal(reason, why, status, access) {
+  const err = new Error(why || reason)
+  err.reason = reason
+  err.status = status
+  if (access) err.access = access
+  // a refusal the user can't clear by signing in again keeps the sign-in
+  err.signIn = reason === "oauth_required" || reason === "unauthorized" ? "expired" : "kept"
+  return err
+}
+
+const MINT_HINTS = {
+  email_unverified: "verify your email on PostHog, then try again",
+  unauthorized: "this sign-in is no longer authorized for the project; sign in again",
+  oauth_required: "sign in again with PostHog Desktop's own app (the plugin does this for you)",
+  blocked: "this account can't use PostHog's AI gateway",
+  desktop_access_blocked: "PostHog Desktop access isn't enabled for this project (it needs a paid plan or an approved org)",
+  credit_bucket_exhausted: "the plan's credits are used up; add credits or wait for the period to reset",
+  org_deactivated: "this organization is deactivated",
+  desktop_access_unavailable: "PostHog couldn't verify Desktop access just now; try again shortly",
+  throttled: "too many gateway-token requests; wait a few minutes",
+  unconfigured: "PostHog hasn't enabled the AI gateway for this cloud",
+  mint_failed: "PostHog couldn't mint a gateway token; try again shortly",
+}
+
+const explainedMint = (e) => (MINT_HINTS[e?.reason] ? `${e.message} — ${MINT_HINTS[e.reason]}` : e?.message ?? String(e))
+
+// gatewayFor is the gateway token for an account's project: the one held while it
+// is good, a mint when it is not, and the same promise to every caller that
+// arrives during a mint. `stale` forces a new one (a 401 from the gateway).
+async function gatewayFor(s, stale = false) {
+  const project = projectOf(s.auth)
+  const key = `${s.region.id}\n${project}\n${s.bearer.slice(-12)}`
+  const was = minted.get(key)
+  if (was?.inFlight) return was.inFlight
+  const now = Date.now()
+  if (was?.value && !stale && now < was.refreshAt) return was.value
+  // the mint is throttled per user: a second one inside this window is not
+  // started, and the token still held answers instead
+  if (was?.value && now - was.mintedAt < MINT_MIN_INTERVAL_MS) {
+    if (!stale) return was.value
+    throw Object.assign(new Error("PostHog's gateway refused this token and a new one was minted moments ago; retry in a few seconds"), { signIn: "kept" })
+  }
+  const entry = was ?? { value: null, mintedAt: 0, refreshAt: 0, inFlight: null }
+  entry.mintedAt = now
+  entry.inFlight = (async () => {
+    const value = await mint(s.region, project, s.bearer)
+    const lifetime = value.expiresAt - Date.now()
+    const skew = Math.min(MINT_MAX_SKEW_MS, Math.max(MINT_MIN_SKEW_MS, lifetime / 10))
+    entry.value = value
+    entry.refreshAt = value.expiresAt - skew
+    return value
+  })().finally(() => {
+    entry.inFlight = null
+  })
+  minted.set(key, entry)
+  return entry.inFlight
+}
+
 // ---- the allowance -----------------------------------------------------------
 
-// usageOf is the plan's allowance as the gateway reports it: its burst and
-// sustained cost limits, each a percent of what it allows, the AI credits
-// the coding plan spends as dollars, and — when the sign-in carries
-// billing:read — the plan's own credit bucket as the cloud's billing reports
-// it (posthog_code_credits: used / limit per billing period).
-function usageOf(u, billing) {
+const ISO = (v) => {
+  if (v === undefined || v === null || v === "") return undefined
+  const d = new Date(v)
+  return Number.isNaN(d.getTime()) ? undefined : d.toISOString()
+}
+
+// usageOf is the plan's allowance as /api/projects/{id}/desktop/usage/ reports
+// it: the plan's dollar bucket when the account's billing reports one, then the
+// burst (daily) and sustained (30-day) valves.
+//
+// A plan with no dollars (code usage not subscribed, and no bucket reported)
+// shows only its sustained valve, as Desktop's own codeUsageMeter does: burst is
+// meaningless there. An absent code_usage_subscribed is unknown, not free, and
+// keeps both valves.
+function usageOf(body) {
+  const u = body ?? {}
   const out = {
-    plan: u.is_pro ? "Pro" : "Free",
+    plan: u?.is_pro ? "Pro" : u?.code_usage_subscribed ? "Desktop" : "Free",
     windows: [],
-    ...(u.billing_period_end ? { until: u.billing_period_end } : {}),
+    ...(ISO(u?.billing_period_end) ? { until: ISO(u.billing_period_end) } : {}),
   }
   const limit = (name, w) => {
     if (!w || typeof w !== "object") return
     out.windows.push({
       name,
       used: Math.max(0, Number(w.used_percent) || 0),
-      ...(w.reset_at ? { resetsAt: w.reset_at } : {}),
+      ...(ISO(w.reset_at) ? { resetsAt: ISO(w.reset_at) } : {}),
       ...(Number.isFinite(w.resets_in_seconds) ? { resetSecs: Math.max(0, Math.round(w.resets_in_seconds)) } : {}),
     })
   }
-  // PostHog's own meter shows a free plan (code usage not subscribed) as only
-  // its sustained valve bucket — burst is meaningless there, exactly as
-  // Desktop's codeUsageMeter returns { kind:"bucket", bucket: sustained }.
-  // An absent code_usage_subscribed is unknown, not free, so it keeps both.
-  if (u.code_usage_subscribed === false) {
+  const credits = u?.ai_credits
+  const usedUsd = Number.isFinite(credits?.used_usd) ? credits.used_usd : null
+  const limitUsd = Number.isFinite(credits?.limit_usd) ? credits.limit_usd : null
+  if (usedUsd !== null && limitUsd !== null && limitUsd > 0) {
+    // the plan's dollars, as Desktop's codeUsageMeter draws them
+    out.windows.push({
+      name: "Credits",
+      used: Math.min(100, (100 * usedUsd) / limitUsd),
+      display: `$${usedUsd.toFixed(2)} / $${limitUsd.toFixed(2)}`,
+      amount: usedUsd,
+      limit: limitUsd,
+      unit: "usd",
+      ...(ISO(u?.billing_period_end) ? { resetsAt: ISO(u.billing_period_end) } : {}),
+    })
+  }
+  if (u?.code_usage_subscribed === false) {
     limit("Sustained", u.sustained)
   } else {
     limit("Burst", u.burst)
     limit("Sustained", u.sustained)
-  }
-  const c = u.ai_credits
-  if (c && Number.isFinite(c.limit_usd) && c.limit_usd > 0) {
-    const used = Number.isFinite(c.used_usd) ? c.used_usd : 0
-    out.windows.push({
-      name: "AI credits",
-      used: (100 * used) / c.limit_usd,
-      display: `$${used.toFixed(2)} / $${c.limit_usd.toFixed(2)}`,
-      amount: used,
-      limit: c.limit_usd,
-      unit: "usd",
-    })
-  }
-  // the plan's own credit bucket, as the cloud's billing reports it — the
-  // number PostHog's web console shows, which the gateway's usage endpoint
-  // never carries; a sign-in without billing:read reads none
-  const b = Array.isArray(billing?.products)
-    ? billing.products.find((p) => p?.usage_key === "posthog_code_credits")
-    : null
-  if (b && Number.isFinite(b.usage_limit) && b.usage_limit > 0) {
-    const used = Number.isFinite(b.current_usage) ? b.current_usage : 0
-    out.windows.push({
-      name: "Code credits",
-      used: (100 * used) / b.usage_limit,
-      display: `${used} / ${b.usage_limit} credits`,
-      amount: used,
-      limit: b.usage_limit,
-      unit: "credits",
-    })
   }
   return out
 }
@@ -648,23 +806,36 @@ function usageOf(u, billing) {
 // ---- answers -----------------------------------------------------------------
 
 // HINTS say what a gateway refusal the user can act on means, in the words the
-// card can carry. Each keeps the sign-in: a refusal is not a lapsed one.
+// card can carry. Each keeps the sign-in unless the token itself was refused.
 const HINTS = [
-  [/credit_bucket_exhausted|out of credits/i, "the plan's credits are used up; add credits or wait for the period to reset"],
-  [/code_access_required|desktop access/i, "PostHog Desktop access isn't enabled for this project (it needs a paid plan or an approved org)"],
-  [/paid_plan_required|needs a paid PostHog plan/i, "this model needs a paid plan; the free tier serves " + FREE_TIER_LIST],
-  [/product_access_denied|OAuth application not authorized/i, "this token wasn't issued to PostHog Desktop's app, so the posthog_code gateway refuses it"],
+  [
+    /credit_bucket_exhausted|out of credits/i,
+    "the plan's credits are used up; add credits or wait for the period to reset",
+  ],
+  [
+    /desktop_access_blocked|desktop access/i,
+    "PostHog Desktop access isn't enabled for this project (it needs a paid plan or an approved org)",
+  ],
+  [/paid_plan_required|model not allowed for this credential/i, "this model needs a paid plan; the free tier serves " + FREE_TIER_LIST],
+  [
+    /product_retired/i,
+    "PostHog retired the old gateway for this product; this plugin mints a gateway token instead — update the plugin",
+  ],
+  [
+    /OAuth application not authorized|product_access_denied/i,
+    "this token wasn't issued to PostHog Desktop's app, so the gateway refuses it",
+  ],
 ]
 
 // explained is a refused answer with the hint for it, if any, and the sign-in
-// kept: the host marks an account lapsed on an error that says to sign in
-// again, and a vendor's refusal is not that.
+// kept unless the gateway refused the credential itself.
 async function explained(res) {
   const text = await res.text()
   const headers = new Headers(res.headers)
   headers.delete("content-length")
   headers.delete("content-encoding")
-  headers.set("X-Magpie-Sign-In", "kept")
+  const lapsed = res.status === 401
+  headers.set("X-Magpie-Sign-In", lapsed ? "expired" : "kept")
   let msg = text.trim().slice(0, 500)
   try {
     const v = JSON.parse(text)
@@ -675,7 +846,7 @@ async function explained(res) {
   for (const [re, hint] of HINTS) {
     if (re.test(text)) {
       headers.set("content-type", "application/json")
-      return new Response(JSON.stringify({ error: { message: `${msg} — ${hint}`, type: "permission_error" } }), {
+      return new Response(JSON.stringify({ error: { message: `${msg} — ${hint}`, type: lapsed ? "authentication_error" : "permission_error" } }), {
         status: res.status,
         statusText: res.statusText,
         headers,
@@ -699,38 +870,58 @@ export const PostHogAuthPlugin = async ({ client }) => ({
     config.provider.posthog ??= {}
     const p = config.provider.posthog
     p.name ??= "PostHog"
-    p.npm ??= NPM
+    p.npm ??= NPM_CHAT
     p.api ??= api(REGIONS.us)
     p.models = { ...fallbackModels({ id: "posthog" }, REGIONS.us), ...(p.models ?? {}) }
   },
 
   provider: {
     id: "posthog",
-    // the plan's own list when the account is signed in and the gateway
-    // answers; the list above otherwise
+    // the plan's own list when the account is signed in and the gateway answers;
+    // the list above otherwise. The gateway's own /v1/models is unfiltered (every
+    // model it serves, for any product), so the product's pin narrows it and the
+    // minted credential's pin marks what this account may actually call: the
+    // models a paid plan unlocks stay listed with free off, as PostHog's own
+    // picker marks them, and magpie's free-only filter leaves them out.
     async models(provider, { auth }) {
       const s = await signedIn(client, auth)
       if (!s) return own(provider, regionOf(auth))
+      let gw
       try {
-        const res = await fetch(modelsUrl(s.region), {
-          headers: { Authorization: `Bearer ${s.bearer}`, Accept: "application/json" },
+        gw = await gatewayFor(s)
+      } catch (e) {
+        // a mint that said no is the account's problem, not a list to fall back
+        // from: magpie shows the reason over the list
+        throw Object.assign(new Error(explainedMint(e)), { signIn: e?.signIn ?? "kept" })
+      }
+      try {
+        const res = await fetch(`${gw.gateway}/v1/models`, {
+          headers: { Authorization: `Bearer ${gw.token}`, Accept: "application/json" },
           signal: AbortSignal.timeout(15000),
         })
         if (!res.ok) return own(provider, s.region)
         const env = await res.json().catch(() => null)
         const list = Array.isArray(env) ? env : env?.data ?? env?.models ?? []
-        const ms = list
-          .filter((m) => m?.id && m.visibility !== "hidden" && m.supported_in_api !== false)
-          .filter((m) => !BLOCKED.has(String(m.id).toLowerCase()))
-          .map((m) => fromGateway(m.id, m))
+        const product = new Set(gw.product)
+        const allowed = gw.allowed === null ? null : new Set(gw.allowed)
+        const ms = []
+        for (const raw of list) {
+          const id = raw?.id
+          if (!id || raw.visibility === "hidden" || raw.supported_in_api === false) continue
+          const names = [id, raw.canonical, ...(Array.isArray(raw.aliases) ? raw.aliases : [])].filter(Boolean)
+          if (!names.some((n) => product.has(n))) continue
+          if (BLOCKED.has(String(id).toLowerCase())) continue
+          const m = fromGateway(id, raw)
+          if (!m.npm) continue // a shape magpie can't speak
+          // free is what the plan serves without paying: a paid credential calls
+          // the whole list, and then only the free tier's models are free; a free
+          // one calls exactly the free tier, and those are all of them
+          if (allowed && gw.plan !== "paid") m.free = names.some((n) => allowed.has(n))
+          ms.push(m)
+        }
         if (!ms.length) return own(provider, s.region)
-        // the marks are per org, and identity-scoped: an org some model is
-        // refused for is served exactly what it is allowed as free; one
-        // everything is allowed for keeps the plan's own free set
-        const restricted = ms.some((m) => !m.allowed)
-        return Object.fromEntries(
-          ms.map((m) => [m.id, modelOf(provider, s.region, restricted ? { ...m, free: m.allowed } : m)]),
-        )
+        const region = { ...s.region, gateway: gw.gateway }
+        return Object.fromEntries(ms.map((m) => [m.id, modelOf(provider, region, m)]))
       } catch {
         return own(provider, s.region)
       }
@@ -749,45 +940,76 @@ export const PostHogAuthPlugin = async ({ client }) => ({
     async loader(getAuth) {
       const first = await signedIn(client, getAuth)
       if (!first) return {}
+      // a mint that said no is why nothing can be sent: said here, with what to
+      // do about it, rather than handed back as an empty set of options
+      let gw
+      try {
+        gw = await gatewayFor(first)
+      } catch (e) {
+        throw Object.assign(new Error(explainedMint(e)), { signIn: e?.signIn ?? "kept" })
+      }
       return {
-        baseURL: api(first.region),
-        apiKey: "",
+        baseURL: `${gw.gateway}/v1`,
+        apiKey: "posthog", // replaced by the minted token on every request below
         async fetch(input, init) {
-          const s = await signedIn(client, getAuth)
-          if (!s) throw new Error("PostHog isn't signed in")
           const req = input instanceof Request ? input : null
-          const headers = new Headers(init?.headers ?? req?.headers)
-          headers.delete("authorization")
-          headers.delete("x-api-key")
-          headers.set("Authorization", `Bearer ${s.bearer}`)
-          headers.set("Accept", headers.get("Accept") ?? "application/json")
-          // the project the token is scoped to, so the gateway authorizes the
-          // request against it rather than the account's current one
-          if (s.auth.project) headers.set("X-PostHog-Project-Id", String(s.auth.project))
           let body = init?.body
           if (body === undefined && req) body = await req.clone().text()
-          const res = await fetch(req ? req.url : input, {
-            ...init,
-            method: init?.method ?? req?.method,
-            headers,
-            body,
-          })
+          const send = async (token, host) => {
+            const headers = new Headers(init?.headers ?? req?.headers)
+            headers.delete("authorization")
+            headers.delete("x-api-key")
+            // the gateway takes the minted token as either header, and magpie's
+            // Anthropic path sends x-api-key, so both are set
+            headers.set("Authorization", `Bearer ${token}`)
+            headers.set("x-api-key", token)
+            headers.set("Accept", headers.get("Accept") ?? "application/json")
+            const url = new URL(req ? req.url : String(input))
+            // the gateway the token was minted for: the request keeps its path
+            // (/v1/chat/completions, /v1/messages), at that host
+            return fetch(`${host}${url.pathname}${url.search}`, {
+              ...init,
+              method: init?.method ?? req?.method,
+              headers,
+              body,
+            })
+          }
+          let s = await signedIn(client, getAuth)
+          if (!s) throw Object.assign(new Error("PostHog isn't signed in"), { signIn: "expired" })
+          let gw
+          try {
+            gw = await gatewayFor(s)
+          } catch (e) {
+            throw Object.assign(new Error(explainedMint(e)), { signIn: e?.signIn ?? "kept" })
+          }
+          let res = await send(gw.token, gw.gateway)
+          if (res.status === 401) {
+            // a token past its end (or one the gateway dropped): mint again, once
+            try {
+              gw = await gatewayFor(s, true)
+              res = await send(gw.token, gw.gateway)
+            } catch (e) {
+              throw Object.assign(new Error(explainedMint(e)), { signIn: e?.signIn ?? "kept" })
+            }
+          }
           return res.status >= 400 ? explained(res) : kept(res)
         },
       }
     },
 
-    // the plan's allowance, as the gateway reports it; each read keeps the
-    // sign-in, so a vendor's refusal never marks the account lapsed
+    // the plan's allowance, as PostHog's own usage endpoint reports it; each read
+    // keeps the sign-in, so a vendor's refusal never marks the account lapsed
     async usage(getAuth) {
       const s = await signedIn(client, getAuth)
       if (!s) return { error: "not signed in", signIn: "kept" }
       try {
-        const res = await fetch(usageUrl(s.region), {
+        const res = await fetch(usageUrl(s.region, projectOf(s.auth)), {
           headers: { Authorization: `Bearer ${s.bearer}`, Accept: "application/json" },
           signal: AbortSignal.timeout(20000),
         })
-        if (res.status === 401) return { error: "PostHog turned this sign-in away; sign in again", signIn: "expired" }
+        if (res.status === 401 || res.status === 403) {
+          return { error: "PostHog turned this sign-in away; sign in again", signIn: "expired" }
+        }
         if (!res.ok) {
           const text = await res.text()
           let why = text.trim().slice(0, 200)
@@ -797,17 +1019,7 @@ export const PostHogAuthPlugin = async ({ client }) => ({
           } catch {}
           return { error: `${why} (HTTP ${res.status})`, signIn: "kept" }
         }
-        // the cloud's billing, for the credit bucket the gateway's usage
-        // never carries; a sign-in without billing:read is simply without it
-        let billing = null
-        try {
-          const b = await fetch(billingUrl(s.region), {
-            headers: { Authorization: `Bearer ${s.bearer}`, Accept: "application/json" },
-            signal: AbortSignal.timeout(15000),
-          })
-          if (b.ok) billing = await b.json().catch(() => null)
-        } catch {}
-        return { ...usageOf(await res.json(), billing), signIn: "kept" }
+        return { ...usageOf(await res.json()), signIn: "kept" }
       } catch (e) {
         return { error: e?.message ?? String(e), signIn: "kept" }
       }
@@ -834,11 +1046,16 @@ export const PostHogAuthPlugin = async ({ client }) => ({
 export const _internal = {
   REGIONS,
   SCOPES,
+  PRODUCT_MODELS,
   FREE_TIER,
+  BLOCKED,
+  FALLBACK,
+  OUTPUTS,
   api,
-  usageUrl,
   modelsUrl,
-  billingUrl,
+  mintUrl,
+  usageUrl,
+  projectOf,
   redirectFor,
   CALLBACK_PORTS,
   saved,
@@ -846,6 +1063,7 @@ export const _internal = {
   fromGateway,
   levelsOf,
   outputOf,
+  npmOf,
   modelOf,
   fallbackModels,
   usageOf,
@@ -854,7 +1072,12 @@ export const _internal = {
   refreshed,
   bearerOf,
   signedIn,
+  gatewayToken,
+  gatewayFor,
+  mint,
+  minted,
   explained,
+  explainedMint,
   HINTS,
   renewing,
   renewed,

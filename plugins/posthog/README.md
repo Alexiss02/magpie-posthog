@@ -2,10 +2,10 @@
 
 PostHog Desktop's coding plan (PostHog Code) as a magpie / OpenCode provider
 plugin: sign in to a PostHog account, and chat with the plan's models through
-PostHog's LLM gateway.
+PostHog's AI gateway.
 
 ```
-magpie plugin add github:Alexiss02/magpie-plugins
+magpie plugin add github:Alexiss02/magpie-posthog
 magpie plugin login posthog
 ```
 
@@ -14,58 +14,112 @@ magpie plugin login posthog
 | | |
 |---|---|
 | Provider id | `posthog` |
-| Gateway | `https://gateway.{us,eu}.posthog.com/posthog_code/v1` (OpenAI-compatible chat completions) |
-| Bearer | the account's `pha_` OAuth access token, which is what the gateway takes |
-| Models | `GET {gateway}/posthog_code/v1/models` — the plan's own list, 30 today |
-| Allowance | `GET {gateway}/v1/usage/posthog_code` — burst, sustained and AI-credit windows |
+| Gateway | `https://ai-gateway.{us,eu}.posthog.com/v1` — OpenAI chat completions, OpenAI responses, Anthropic messages |
+| Credential | a `phe_` gateway token minted per project at `POST {cloud}/api/projects/{project}/desktop/gateway_token/` |
+| Models | the gateway's `/v1/models`, narrowed to the desktop product's pin and marked by the minted credential's own pin |
+| Allowance | `GET {cloud}/api/projects/{project}/desktop/usage/` — the plan's dollars and its daily / 30-day valves |
 
-The `posthog_code` product accepts OAuth tokens from PostHog Desktop's three OAuth applications
-only, and those apps' scope ceilings are `@default` plus the privileged `llm_gateway:read` the
-gateway requires. So the plugin signs in as the Desktop app (its public client id, PKCE S256, no
-secret) and asks for `openid profile email llm_gateway:read`; the server clamps that to the
-ceiling and grants it. It does not need the Desktop app installed.
+The `posthog_code` product on the older `gateway.{us,eu}.posthog.com` gateway is retired: it
+answers every caller with `product_retired`. PostHog Desktop now mints a short-lived `phe_` token
+from Django and calls the AI gateway with it, and so does this plugin.
 
 ## Signing in
 
 **PostHog account (browser).** The plugin binds a loopback port, opens
-`{region}/oauth/authorize/` with PKCE S256 and `required_access_level=project`, and takes the code
-the browser brings back to `http://localhost:{port}/callback` — the portless redirect the Desktop
-app registered, so any port is accepted. It then exchanges the code at `{region}/oauth/token` and
-keeps the access and refresh tokens.
+`{cloud}/oauth/authorize/` with PKCE S256 and `required_access_level=project`, and takes the code
+the browser brings back to `http://localhost:{8237,8239}/callback` — the ports the Desktop app
+registered, so the redirect is accepted. It exchanges the code at `{cloud}/oauth/token` and keeps
+the access and refresh tokens. The OAuth client is PostHog Desktop's own, which is the only thing
+the token mint accepts.
 
-**PostHog OAuth access token.** Paste a `pha_…` token minted elsewhere (the Desktop app's own
-sign-in, or a script's). Pick the region it belongs to. Nothing is refreshed until you sign in in
-the browser, since a bare access token has no refresh token beside it.
+**PostHog OAuth access token.** Paste a `pha_…` token minted elsewhere. Pick the region it belongs
+to. It is used to mint gateway tokens; nothing is refreshed until you sign in in the browser, since
+a bare access token has no refresh token beside it.
 
 The Desktop app's own session lives in `%APPDATA%\PostHog\posthog-code.db`, an AES-256-GCM blob
 keyed to this machine's id; the plugin does not read it. Use the browser sign-in instead.
 
-## Notes
+## The gateway token
 
-- **Projects.** The gateway authorizes a request against the project its token names. When the
-  consent picks exactly one project, the plugin sends it as `X-PostHog-Project-Id`; with several,
-  the gateway falls back to the account's current one. `posthog_code` additionally needs Desktop
-  access enabled for that project, which PostHog grants to paid plans.
-- **Names.** The gateway's `display_name` is the raw model id (`@cf/zai-org/glm-5.2`), so the
-  plugin uses the label PostHog's own model catalog gives each model (`GLM-5.2`).
-- **Reasoning levels.** The gateway's model list carries none — `supported_reasoning_levels` is
-  empty for all 30 — so the plugin takes the depths from PostHog's model catalog, the same data
-  its Desktop picker draws its effort dropdown from: Claude Opus/Sonnet 5 the extended ladder
-  (low→ultracode), Opus 4.5 the standard three, GPT-5.5 up to xhigh, the GLM family two depths
-  (high, max), and Kimi K3 and DeepSeek V4 Flash none at all. The gateway's own answer wins if it
-  ever carries one.
-- **Free tier.** PostHog's free tier serves four models — `@cf/zai-org/glm-5.2`,
-  `deepseek-ai/deepseek-v4-flash-0731`, `moonshotai/kimi-k3`, `zai-org/glm-5.3-flash` — which the
-  plugin marks `free`, so magpie badges them and its free-only filter picks them. Anything else
-  needs a paid plan and comes back as a refusal the card explains, naming what the free tier does
-  serve.
-- **Refusals keep the sign-in.** A gateway 403 (credits spent, no paid plan, Desktop access off,
-  the wrong OAuth app) is reported with what to do about it and never marks the account lapsed;
-  only a 401 from the usage read does.
+The AI gateway takes neither the account's `pha_` token nor a personal API key: it takes a `phe_`
+token, minted for one project. So every request path starts with a mint:
+
+```
+POST https://us.posthog.com/api/projects/608221/desktop/gateway_token/
+Authorization: Bearer pha_…
+```
+
+Its 201 carries `token`, `expires_at` (300 s by default), `gateway_url`, `plan`
+(`free` / `paid`), `allowed_models` (what this credential may call) and `product_models`
+(the desktop product's whole list). Any other status is a refusal whose `reason` says which —
+`credit_bucket_exhausted`, `desktop_access_blocked`, `email_unverified`, `unauthorized`,
+`throttled`, `unconfigured`, `mint_failed` — and each is reported with what to do about it.
+
+The plugin holds the minted token per project until a tenth of its lifetime is left, mints once
+even when several requests arrive together, and mints again on a 401 from the gateway. It never
+mints twice inside five seconds: the mint is throttled to 120 an hour for the whole account, so a
+second refusal that fast is reported as an error to retry rather than turned into a mint loop.
+
+## Models
+
+The gateway's `/v1/models` is unfiltered — every model it serves for any product, including Gemini
+models and PostHog's own. The plugin narrows it three ways, as Desktop's own session does:
+
+1. the desktop product's pin (`product_models` from the mint), so nothing outside the plan is
+   offered;
+2. PostHog's own blocklist of older ids (`gpt-5-mini`, `gpt-5.2`, `gpt-5.3-codex`,
+   `claude-opus-4-5/4-6`, `claude-sonnet-4-5`, `claude-haiku-4-5`);
+3. the shape it is served on — `gemini-generate-content` and `systemone` are dropped, since magpie
+   can speak neither.
+
+Each model's `api_shapes` decides which API magpie uses: Claude models are served on Anthropic's
+Messages API only, so they are listed as `@ai-sdk/anthropic`; the open-weight and OpenAI models
+answer chat completions, so they are `@ai-sdk/openai-compatible`. A model served on both takes chat
+completions.
+
+**Free tier.** A free-plan credential may call exactly four models —
+`zai-org/glm-5.2`, `deepseek-ai/deepseek-v4-flash-0731`, `moonshotai/kimi-k3`,
+`zai-org/glm-5.3-flash` — and those are marked `free`, so magpie badges them and its free-only
+filter picks them. Every other model stays listed with `free` off: asking for one on a free plan
+answers 403 `model_not_allowed`, which the card explains, naming what the free tier does serve.
+
+**Reasoning levels.** The gateway takes `minimal`, `low`, `medium`, `high`, `xhigh`, `max` and
+`none` — anything else is a 400. Desktop's catalog gives each model its ladder, and the plugin
+publishes those (minus `ultracode`, which is Desktop's own top rung and not a gateway value):
+Opus 5 / Sonnet 5 / Fable up to `max`, Sonnet 4.6 and Opus 4.5 the standard three, GPT-5.5 up to
+`xhigh`, the GLM family two depths (`high`, `max`), and Kimi and DeepSeek none at all.
+
+**Reply limits.** The context window is what a prompt and its reply share. Kimi's backend rejects
+a sum over its window, so its reply is capped at half of it (524288); every other model takes its
+window, which is what a client asks for when it is told the window alone.
+
+## Allowance
+
+`/desktop/usage/` reports the plan's dollar bucket (`ai_credits`, from the organization's billing)
+and two valves, `burst` (daily) and `sustained` (30 days). The card shows:
+
+- the dollars as `Credits`, `$used / $limit` with the billing period's end, when billing reports
+  them;
+- a plan with no dollars as only its `Sustained` valve, exactly as Desktop's own usage meter draws
+  a free plan — the burst valve is meaningless there.
+
+A 401 or 403 from the usage read marks the account lapsed; every other failure keeps the sign-in.
+
+## Refusals
+
+A gateway refusal never marks the account lapsed, except a 401 from the gateway itself (the
+credential, not the plan, was refused) — the plugin mints once more and retries before saying so.
+The refusals it explains: credits used up, Desktop access not enabled for the project, a model that
+needs a paid plan (naming the free tier), a credential that isn't Desktop's, and the retired
+product.
 
 ## Self-check
 
 ```
 node test-posthog.mjs           # the pure parts and the hooks, offline
-node test-posthog.mjs --live    # also asks the gateway for its model list
+node test-posthog.mjs --live    # also signs in and talks to PostHog
 ```
+
+`--live` uses the sign-in magpie keeps (`~/.config/magpie/plugin-auth.json`) or a
+`POSTHOG_ACCESS` token, lists the plan's models, reads the allowance, and sends one chat to a free
+model through the plugin's own fetch.

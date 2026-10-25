@@ -1,7 +1,8 @@
 // Self-check for the PostHog plugin's pure parts and its hooks, against a fake
-// client and (for the models/usage hooks) the live gateway.
+// client and a fake gateway (for the models/usage hooks), and — with --live —
+// the real cloud and AI gateway.
 //   node test-posthog.mjs            hooks only, no network
-//   node test-posthog.mjs --live     also asks the real gateway's model list
+//   node test-posthog.mjs --live     also signs in and talks to PostHog
 import assert from "node:assert/strict"
 import { PostHogAuthPlugin, _internal as I } from "./index.mjs"
 
@@ -13,44 +14,48 @@ const config = {}
 await hooks.config(config)
 assert.equal(config.provider.posthog.name, "PostHog")
 assert.equal(config.provider.posthog.npm, "@ai-sdk/openai-compatible")
-assert.equal(config.provider.posthog.api, "https://gateway.us.posthog.com/posthog_code/v1")
-assert.equal(Object.keys(config.provider.posthog.models).length, 23)
+assert.equal(config.provider.posthog.api, "https://ai-gateway.us.posthog.com/v1")
+// the gateway's catalogue, minus the models Desktop's own app blocks
+assert.equal(Object.keys(config.provider.posthog.models).length, 25)
 assert.equal(config.provider.posthog.models["claude-sonnet-5"].limit.context, 1000000)
+assert.equal(config.provider.posthog.models["claude-sonnet-5"].api.npm, "@ai-sdk/anthropic")
+assert.equal(config.provider.posthog.models["zai-org/glm-5.2"].api.npm, "@ai-sdk/openai-compatible")
 // the four the gateway serves without a paid plan, and no others
-assert.equal(config.provider.posthog.models["@cf/zai-org/glm-5.2"].name, "GLM-5.2")
-assert.equal(config.provider.posthog.models["@cf/zai-org/glm-5.2"].free, true)
+assert.equal(config.provider.posthog.models["zai-org/glm-5.2"].name, "GLM-5.2")
+assert.equal(config.provider.posthog.models["zai-org/glm-5.2"].free, true)
 assert.equal(config.provider.posthog.models["deepseek-ai/deepseek-v4-flash-0731"].free, true)
 assert.equal(config.provider.posthog.models["moonshotai/kimi-k3"].free, true)
 assert.equal(config.provider.posthog.models["zai-org/glm-5.3-flash"].free, true)
 assert.equal(config.provider.posthog.models["claude-opus-5"].free, false)
 assert.equal(config.provider.posthog.models["gpt-5.5"].free, false)
-// the models PostHog's own app blocks never list, signed out or in
+// the models PostHog's own app blocks never list
 assert.equal(config.provider.posthog.models["gpt-5-mini"], undefined)
 assert.equal(config.provider.posthog.models["gpt-5.2"], undefined)
 assert.equal(config.provider.posthog.models["claude-opus-4-6"], undefined)
 assert.equal(config.provider.posthog.models["claude-haiku-4-5"], undefined)
 
-// ---- the redirect the app registered ----------------------------------------
+// ---- the endpoints ------------------------------------------------------------
 assert.equal(I.redirectFor(51234), "http://localhost:51234/callback")
-// the posthog_code app registers only http://localhost:{8237,8239}/callback,
-// and PostHog port-relaxes a redirect only when the app registers the portless
-// form — so the callback must sit on one of those two or consent fails with
-// "Mismatching redirect URI" (observed on an ephemeral-port EU login)
-assert.equal(I.redirectFor(8237), "http://localhost:8237/callback")
-assert.equal(I.redirectFor(8239), "http://localhost:8239/callback")
+// the posthog_code app registers only http://localhost:{8237,8239}/callback, and
+// PostHog port-relaxes a redirect only when the app registers the portless form
 assert.deepEqual(I.CALLBACK_PORTS, [8237, 8239])
-assert.equal(I.api(I.REGIONS.eu), "https://gateway.eu.posthog.com/posthog_code/v1")
-assert.equal(I.usageUrl(I.REGIONS.us), "https://gateway.us.posthog.com/v1/usage/posthog_code")
+assert.equal(I.api(I.REGIONS.eu), "https://ai-gateway.eu.posthog.com/v1")
+assert.equal(I.modelsUrl(I.REGIONS.us), "https://ai-gateway.us.posthog.com/v1/models")
+assert.equal(
+  I.mintUrl(I.REGIONS.us, 608221),
+  "https://us.posthog.com/api/projects/608221/desktop/gateway_token/",
+)
+assert.equal(I.usageUrl(I.REGIONS.eu, "@current"), "https://eu.posthog.com/api/projects/@current/desktop/usage/")
 assert.equal(I.SCOPES.includes("llm_gateway:read"), true)
-assert.equal(I.SCOPES.includes("billing:read"), true)
-assert.equal(I.billingUrl(I.REGIONS.us), "https://us.posthog.com/api/billing/")
+// no billing:read: the desktop usage endpoint carries the plan's dollars
+assert.equal(I.SCOPES.includes("billing:read"), false)
 
 // ---- a token response as the account keeps it --------------------------------
 const env = {
   access_token: "pha_x",
   refresh_token: "phr_y",
   expires_in: 3600,
-  scoped_organizations: ["0f1e"],
+  scoped_organizations: [1],
   scoped_teams: [12345],
 }
 const s = I.saved(I.REGIONS.us, env)
@@ -58,39 +63,67 @@ assert.equal(s.type, "success")
 assert.equal(s.access, "pha_x")
 assert.equal(s.refresh, "phr_y")
 assert.equal(s.region, "us")
-assert.equal(s.project, 12345) // one scoped project is the one requests name
+assert.equal(s.project, 12345) // one scoped project is the one the mint names
 assert.ok(s.expires > Date.now())
 assert.match(s.accountId, /PostHog US/)
-// two projects name none, so no header is sent for them
+// two projects name none, so the mint asks for the account's current one
 assert.equal(I.saved(I.REGIONS.us, { ...env, scoped_teams: [1, 2] }).project, undefined)
+assert.equal(I.projectOf(I.saved(I.REGIONS.us, { ...env, scoped_teams: [1, 2] })), "@current")
+
+// ---- the mint's answer as the plugin holds it ---------------------------------
+const gw = I.gatewayToken(I.REGIONS.us, {
+  token: "phe_t",
+  expires_at: new Date(Date.now() + 300e3).toISOString(),
+  gateway_url: "https://ai-gateway.us.posthog.com",
+  plan: "free",
+  allowed_models: ["zai-org/glm-5.2", "moonshotai/kimi-k3"],
+  product_models: ["zai-org/glm-5.2", "claude-sonnet-5"],
+})
+assert.equal(gw.token, "phe_t")
+assert.equal(gw.gateway, "https://ai-gateway.us.posthog.com")
+assert.equal(gw.plan, "free")
+assert.deepEqual(gw.allowed, ["zai-org/glm-5.2", "moonshotai/kimi-k3"])
+assert.deepEqual(gw.product, ["zai-org/glm-5.2", "claude-sonnet-5"])
+assert.ok(gw.expiresAt > Date.now())
+// a mint that names no product list keeps the plan's own
+assert.deepEqual(I.gatewayToken(I.REGIONS.us, { token: "phe_t", expires_at: "x" }).product, I.PRODUCT_MODELS)
+assert.equal(I.gatewayToken(I.REGIONS.us, { token: "phe_t" }).plan, "free")
 
 // ---- a gateway model as a plugin model ---------------------------------------
-const m = I.modelOf({ id: "posthog" }, I.REGIONS.eu, I.fromGateway("gpt-5.5", {
-  id: "gpt-5.5",
-  display_name: "gpt-5.5",
-  context_window: 1050000,
-  supports_vision: true,
-  supported_reasoning_levels: ["low", "high"],
-  pricing: { prompt: "0.000005", completion: "0.00003", input_cache_read: "0.0000005" },
+// the Go gateway's shape: api_shapes say which API it answers, and its prices
+// are strings of dollars per token
+const m = I.modelOf({ id: "posthog" }, I.REGIONS.eu, I.fromGateway("zai-org/glm-5.2", {
+  id: "zai-org/glm-5.2",
+  name: "GLM-5.2",
+  context_window: 262144,
+  api_shapes: ["openai-chat-completions", "openai-responses", "anthropic-messages"],
+  pricing: { prompt: "0.0000014", completion: "0.0000044", cache_read: "0.00000026" },
 }))
-assert.equal(m.name, "GPT-5.5") // PostHog's own label, not the raw id
-assert.equal(m.limit.context, 1050000)
-assert.equal(m.cost.input, 0.000005)
-assert.equal(m.cost.cache.read, 0.0000005)
-assert.equal(m.api.url, "https://gateway.eu.posthog.com/posthog_code/v1")
-assert.deepEqual(Object.keys(m.variants), ["low", "high"])
-assert.equal(m.capabilities.attachment, true)
-// the org's own marks, as Desktop reads them: refused models say why, an
-// absent mark is allowed
-const gated = I.fromGateway("claude-opus-5", { allowed: false, restriction_reason: "paid_plan_required" })
-assert.equal(gated.allowed, false)
-assert.equal(gated.reason, "paid_plan_required")
-assert.equal(I.fromGateway("zai-org/glm-5.3-flash", {}).allowed, true)
+assert.equal(m.name, "GLM-5.2")
+assert.equal(m.api.url, "https://ai-gateway.eu.posthog.com/v1")
+assert.equal(m.api.npm, "@ai-sdk/openai-compatible") // chat completions, as the shape list leads
+assert.equal(m.limit.context, 262144)
+assert.equal(m.cost.input, 0.0000014)
+assert.equal(m.cost.cache.read, 0.00000026)
+assert.equal(m.cost.cache.write, 0)
+assert.deepEqual(Object.keys(m.variants), ["high", "max"])
+assert.equal(m.capabilities.attachment, false) // GLM takes no images
+assert.equal(m.capabilities.reasoning, true)
+// Claude is served on the Messages API only, so magpie is told to speak that
+const claude = I.fromGateway("claude-opus-5", { context_window: 1000000, api_shapes: ["anthropic-messages"] })
+assert.equal(claude.npm, "@ai-sdk/anthropic")
+assert.equal(I.modelOf({ id: "posthog" }, I.REGIONS.us, claude).capabilities.attachment, true)
+// a shape magpie can't speak is not offered
+assert.equal(I.fromGateway("gemini-3.5-flash", { api_shapes: ["gemini-generate-content"] }).npm, null)
+// no shapes at all: the family's, the Messages API for Claude
+assert.equal(I.npmOf("claude-sonnet-5", []), "@ai-sdk/anthropic")
+assert.equal(I.npmOf("zai-org/glm-5.2", []), "@ai-sdk/openai-compatible")
 
 // ---- the reasoning depths, which the gateway's list never carries --------------
-// every one of its 30 models answers supported_reasoning_levels: [], so the
-// catalog's are what a model gets
-assert.equal(I.levelsOf("claude-opus-5").join(","), "low,medium,high,xhigh,max,ultracode")
+// every one of its models answers supported_reasoning_levels: [], so the
+// catalog's are what a model gets — and only the depths the gateway accepts
+// (ultracode is Desktop's own rung and a 400 here, so it is on no ladder)
+assert.equal(I.levelsOf("claude-opus-5").join(","), "low,medium,high,xhigh,max")
 assert.equal(I.levelsOf("claude-opus-4-5").join(","), "low,medium,high")
 assert.equal(I.levelsOf("claude-sonnet-4-6").join(","), "low,medium,high")
 assert.equal(I.levelsOf("gpt-5.5").join(","), "low,medium,high,xhigh")
@@ -98,7 +131,7 @@ assert.equal(I.levelsOf("gpt-5.6-sol").join(","), "low,medium,high,xhigh,max")
 assert.equal(I.levelsOf("gpt-6.1-sol").join(","), "low,medium,high,xhigh,max")
 // GLM takes two depths, not the ladder
 assert.deepEqual(I.levelsOf("zai-org/glm-5.3-flash"), ["high", "max"])
-assert.deepEqual(I.levelsOf("@cf/zai-org/glm-5.2"), ["high", "max"])
+assert.deepEqual(I.levelsOf("zai-org/glm-5.2"), ["high", "max"])
 // Kimi and DeepSeek reason, but expose no depth to pick
 assert.deepEqual(I.levelsOf("moonshotai/kimi-k3"), [])
 assert.deepEqual(I.levelsOf("deepseek-ai/deepseek-v4-flash-0731"), [])
@@ -107,78 +140,92 @@ assert.equal(I.levelsOf("gpt-5.4").join(","), "low,medium,high")
 assert.equal(I.levelsOf("gpt-5.3-codex").join(","), "low,medium,high")
 // an unnamed Claude model yields none: PostHog never gave it a depth to pick
 assert.deepEqual(I.levelsOf("claude-unnamed-9"), [])
-// the gateway's own answer wins when it ever carries one
-assert.equal(I.fromGateway("claude-opus-5", { supported_reasoning_levels: ["low"] }).levels.join(","), "low")
-assert.equal(I.fromGateway("moonshotai/kimi-k3", {}).levels.length, 0)
-assert.equal(I.modelOf({ id: "posthog" }, I.REGIONS.us, I.fromGateway("zai-org/glm-5.3-flash", {})).capabilities.reasoning, true)
-assert.equal(I.modelOf({ id: "posthog" }, I.REGIONS.us, I.fromGateway("moonshotai/kimi-k3", {})).capabilities.reasoning, false)
 
-// ---- the reply limit, which magpie fills from models.dev when the plugin omits
-// it. models.dev lists DeepSeek V4 Flash's output at 384000, above the 262144
-// its backend takes, so the plugin names the cap itself; every other model is
-// told its window, which is what its backend accepts.
-assert.equal(I.outputOf("deepseek-ai/deepseek-v4-flash-0731", 1048000), 262144)
-assert.equal(I.outputOf("moonshotai/kimi-k3", 262144), 262144)
+// ---- the reply limit ----------------------------------------------------------
+// the window is what a prompt and its reply share; Kimi's backend rejects a sum
+// over it, so its reply is half the window. Everything else takes its window.
+assert.equal(I.outputOf("moonshotai/kimi-k3", 1048576), 524288)
+assert.equal(I.outputOf("zai-org/glm-5.2", 262144), 262144)
 assert.equal(I.outputOf("zai-org/glm-5.3-flash", 1000000), 1000000)
+assert.equal(I.outputOf("deepseek-ai/deepseek-v4-flash-0731", 1048000), 1048000)
 // never more than the window: a reply cannot outgrow the room its prompt left
-assert.equal(I.outputOf("deepseek-ai/deepseek-v4-flash-0731", 200000), 200000)
+assert.equal(I.outputOf("moonshotai/kimi-k3", 262144), 262144)
 assert.equal(I.outputOf("unknown-model", 500000), 500000)
 assert.equal(I.outputOf("unknown-model", 0), 0)
-// and the shape a client reads carries it
-assert.equal(I.modelOf({ id: "posthog" }, I.REGIONS.us, I.fromGateway("deepseek-ai/deepseek-v4-flash-0731", { context_window: 1048000 })).limit.output, 262144)
-assert.equal(I.modelOf({ id: "posthog" }, I.REGIONS.us, I.fromGateway("moonshotai/kimi-k3", { context_window: 262144 })).limit.output, 262144)
+assert.equal(I.modelOf({ id: "posthog" }, I.REGIONS.us, I.fromGateway("moonshotai/kimi-k3", { context_window: 1048576 })).limit.output, 524288)
 
-// ---- the allowance -----------------------------------------------------------
+// ---- the allowance ------------------------------------------------------------
+// a plan that pays: the dollar bucket first, then the two valves
 const u = I.usageOf({
-  is_pro: true,
-  burst: { used_percent: 12.5, resets_in_seconds: 900, reset_at: "2026-10-11T12:00:00Z", exceeded: false },
-  sustained: { used_percent: 3, resets_in_seconds: 86400, reset_at: "2026-10-12T00:00:00Z", exceeded: false },
-  ai_credits: { exhausted: false, used_usd: 2.5, limit_usd: 10 },
-  billing_period_end: "2026-11-01T00:00:00Z",
+  product: "posthog_code",
+  burst: { used_percent: 12.5, resets_in_seconds: 86400, reset_at: "2026-10-26T00:00:00Z", exceeded: false },
+  sustained: { used_percent: 3, resets_in_seconds: 2592000, reset_at: "2026-11-24T00:00:00Z", exceeded: false },
+  ai_credits: { exhausted: false, used_usd: 0.48, limit_usd: 20, breakdown: { token_credits: 48 } },
+  is_rate_limited: false,
+  is_pro: false,
+  code_usage_subscribed: true,
+  billing_period_end: "2026-11-13T05:58:42.090000Z",
 })
-assert.equal(u.plan, "Pro")
-assert.deepEqual(u.windows.map((w) => w.name), ["Burst", "Sustained", "AI credits"])
-assert.equal(u.windows[0].used, 12.5)
-assert.equal(u.windows[0].resetSecs, 900)
-assert.equal(u.windows[2].used, 25)
-assert.equal(u.windows[2].display, "$2.50 / $10.00")
-assert.equal(u.until, "2026-11-01T00:00:00Z")
-// no credits window when the plan reports none
-assert.deepEqual(I.usageOf({ is_pro: false, ai_credits: { exhausted: false } }).windows, [])
-assert.equal(I.usageOf({ is_pro: false }).plan, "Free")
-// a free plan (code usage not subscribed) shows only the sustained bucket,
-// as Desktop's codeUsageMeter does — burst is dropped
+assert.equal(u.plan, "Desktop")
+assert.deepEqual(u.windows.map((w) => w.name), ["Credits", "Burst", "Sustained"])
+assert.equal(u.windows[0].display, "$0.48 / $20.00")
+assert.equal(u.windows[0].amount, 0.48)
+assert.equal(u.windows[0].limit, 20)
+assert.equal(u.windows[0].unit, "usd")
+assert.equal(u.windows[0].used, 2.4)
+assert.equal(u.windows[0].resetsAt, "2026-11-13T05:58:42.090Z")
+assert.equal(u.windows[1].used, 12.5)
+assert.equal(u.windows[1].resetSecs, 86400)
+assert.equal(u.until, "2026-11-13T05:58:42.090Z")
+
+// a free plan (code usage not subscribed) shows its sustained valve and no
+// dollars, as Desktop's own codeUsageMeter does; burst is meaningless there
 const free = I.usageOf({
+  burst: { used_percent: 40, resets_in_seconds: 86400, reset_at: "2026-10-26T00:00:00Z", exceeded: false },
+  sustained: { used_percent: 1, resets_in_seconds: 2592000, reset_at: "2026-11-24T00:00:00Z", exceeded: false },
+  ai_credits: { exhausted: false, used_usd: null, limit_usd: null, breakdown: null },
   is_pro: false,
   code_usage_subscribed: false,
-  burst: { used_percent: 10, resets_in_seconds: 86400, reset_at: "2026-10-12T00:00:00Z", exceeded: false },
-  sustained: { used_percent: 3, resets_in_seconds: 2592000, reset_at: "2026-11-10T00:00:00Z", exceeded: false },
+  billing_period_end: "2026-11-13T05:58:42.090000Z",
 })
+assert.equal(free.plan, "Free")
 assert.deepEqual(free.windows.map((w) => w.name), ["Sustained"])
-assert.equal(free.windows[0].used, 3)
-// the credit bucket, as the cloud's billing reports it: the gateway's usage
-// never carries it, so it comes from billing:read — and without one, none
-const bucket = I.usageOf(
-  { is_pro: false, code_usage_subscribed: false, sustained: { used_percent: 0, resets_in_seconds: 2592000, reset_at: "2026-11-13T00:00:00Z", exceeded: false } },
-  { products: [{ usage_key: "posthog_code_credits", current_usage: 2445, usage_limit: 2000, percentage_usage: 1.2225 }] },
-)
-assert.deepEqual(bucket.windows.map((w) => w.name), ["Sustained", "Code credits"])
-assert.equal(bucket.windows[1].used, 122.25)
-assert.equal(bucket.windows[1].display, "2445 / 2000 credits")
-assert.equal(bucket.windows[1].unit, "credits")
-assert.deepEqual(I.usageOf({ is_pro: false }, { products: [] }).windows, [])
+assert.equal(free.windows[0].used, 1)
+
+// an absent code_usage_subscribed is unknown, not free: both valves stay
+const unknown = I.usageOf({ burst: { used_percent: 1 }, sustained: { used_percent: 2 } })
+assert.deepEqual(unknown.windows.map((w) => w.name), ["Burst", "Sustained"])
+// and a usage read with nothing in it is a plan with no windows
+assert.deepEqual(I.usageOf({}).windows, [])
+assert.deepEqual(I.usageOf(undefined).windows, [])
 
 // ---- a refusal keeps the sign-in and says what it means ----------------------
-const refused = await I.explained(new Response(
-  JSON.stringify({ error: { message: "Model 'claude-opus-5' needs a paid PostHog plan.", type: "permission_error", code: "product_access_denied" } }),
-  { status: 403, headers: { "content-type": "application/json" } },
-))
+const refused = await I.explained(
+  new Response(
+    JSON.stringify({
+      error: { message: "model not allowed for this credential", type: "permission_error", code: "model_not_allowed" },
+    }),
+    { status: 403, headers: { "content-type": "application/json" } },
+  ),
+)
 assert.equal(refused.status, 403)
 assert.equal(refused.headers.get("X-Magpie-Sign-In"), "kept")
 const said = await refused.json()
-assert.match(said.error.message, /paid plan/)
+assert.match(said.error.message, /model not allowed/)
 assert.match(said.error.message, /needs a paid plan/) // the hint, not just the vendor's words
 assert.match(said.error.message, /glm-5\.2/) // and it names what the free tier does serve
+// a retired product says so rather than leaving the user to guess
+const retired = await I.explained(
+  new Response(JSON.stringify({ error: { message: "PostHog Code no longer runs on this gateway.", reason: "product_retired" } }), {
+    status: 403,
+    headers: { "content-type": "application/json" },
+  }),
+)
+assert.match((await retired.json()).error.message, /update the plugin/)
+// the gateway refusing the credential itself is the one thing that marks it
+const unauth = await I.explained(new Response('{"error":{"message":"authentication failed"}}', { status: 401 }))
+assert.equal(unauth.headers.get("X-Magpie-Sign-In"), "expired")
+// anything else is carried through as it came
 const other = await I.explained(new Response("boom", { status: 500 }))
 assert.equal(await other.text(), "boom")
 assert.equal(other.headers.get("X-Magpie-Sign-In"), "kept")
@@ -190,79 +237,245 @@ assert.equal(I.stale({}), false)
 assert.equal(I.bearerOf({ type: "api", key: "pha_z" }), "pha_z")
 assert.equal(I.bearerOf({ type: "oauth", access: "pha_a", refresh: "phr_b" }), "pha_a")
 
-// ---- signedIn: the account behind every gateway read --------------------------
-// nothing signed in, either way the host hands the account over
+// ---- signedIn: the account behind every read ---------------------------------
 assert.equal(await I.signedIn(client, async () => undefined), null)
 assert.equal(await I.signedIn(client, undefined), null)
 assert.equal(await I.signedIn(client, { region: "us" }), null)
-// an account with an access token, read straight or through the host's reader
 const held = { type: "api", key: "pha_z", region: "us" }
 const one = await I.signedIn(client, async () => held)
 assert.equal(one.bearer, "pha_z")
 assert.equal(one.region.id, "us")
-assert.equal(one.region.gateway, "https://gateway.us.posthog.com")
+assert.equal(one.region.gateway, "https://ai-gateway.us.posthog.com")
 assert.equal((await I.signedIn(client, held)).bearer, "pha_z")
-// a stored sign-in with no access token at all is not one
 assert.equal(await I.signedIn(client, async () => ({ type: "oauth", refresh: "phr_b" })), null)
 
 // ---- the hooks, without a sign-in --------------------------------------------
 const models = await hooks.provider.models({ id: "posthog" }, { auth: undefined })
-assert.equal(Object.keys(models).length, 23)
+assert.equal(Object.keys(models).length, 25)
 const anon = await hooks.auth.usage(async () => undefined)
 assert.equal(anon.error, "not signed in")
 assert.equal(hooks.auth.loader(async () => undefined) instanceof Promise, true)
 assert.equal(await hooks.auth.loader(async () => undefined).then((o) => o.baseURL), undefined)
 
-// ---- the hooks, with a sign-in: the gateway's per-org marks -------------------
-// an org some model is refused for is served exactly what it is allowed as
-// free; one everything is allowed for keeps the plan's own free set
+// ---- the hooks, with a sign-in, against a fake cloud and gateway --------------
 const realFetch = globalThis.fetch
-const entry = (id, allowed) => ({
-  id,
-  allowed,
-  restriction_reason: allowed ? null : "paid_plan_required",
-  context_window: 1000000,
-  supports_vision: false,
-  pricing: { prompt: "0.000001", completion: "0.000002" },
-})
-const withList = (ms) => async () =>
-  new Response(JSON.stringify({ data: ms }), { status: 200, headers: { "content-type": "application/json" } })
-const signed = { type: "api", key: "pha_z", region: "us" }
+const json = (body, status = 200) =>
+  new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } })
+const gatewayModels = [
+  {
+    id: "zai-org/glm-5.2",
+    name: "GLM-5.2",
+    context_window: 262144,
+    canonical: "posthog/zai-org/glm-5.2",
+    api_shapes: ["openai-chat-completions", "anthropic-messages"],
+    pricing: { prompt: "0.0000014", completion: "0.0000044", cache_read: "0.00000026" },
+  },
+  {
+    id: "claude-opus-5",
+    name: "Claude Opus 5",
+    context_window: 1000000,
+    canonical: "anthropic/claude-opus-5",
+    api_shapes: ["anthropic-messages"],
+    pricing: { prompt: "0.000005", completion: "0.000025" },
+  },
+  {
+    // served by the gateway for another product, and outside the desktop pin
+    id: "gemini-3.5-flash",
+    name: "Gemini 3.5 Flash",
+    context_window: 1048576,
+    canonical: "google/gemini-3.5-flash",
+    api_shapes: ["gemini-generate-content"],
+  },
+]
+const signed = { type: "oauth", access: "pha_z", refresh: "phr_y", expires: Date.now() + 3600e3, region: "us", project: 608221 }
+let sent = []
+let mintedAt = 0
 try {
-  globalThis.fetch = withList([entry("claude-opus-5", false), entry("zai-org/glm-5.3-flash", true)])
-  const restricted = await hooks.provider.models({ id: "posthog" }, { auth: signed })
-  assert.equal(restricted["claude-opus-5"].free, false)
-  assert.equal(restricted["zai-org/glm-5.3-flash"].free, true)
-  globalThis.fetch = withList([entry("claude-opus-5", true), entry("zai-org/glm-5.3-flash", true)])
-  const paid = await hooks.provider.models({ id: "posthog" }, { auth: signed })
-  assert.equal(paid["claude-opus-5"].free, false)
-  assert.equal(paid["zai-org/glm-5.3-flash"].free, true)
-  // usage reads the gateway's buckets and, with billing:read, the credit bucket
-  globalThis.fetch = async (url) =>
-    String(url).includes("/api/billing/")
-      ? new Response(JSON.stringify({ products: [{ usage_key: "posthog_code_credits", current_usage: 66, usage_limit: 2000, percentage_usage: 0.033 }] }), { status: 200, headers: { "content-type": "application/json" } })
-      : new Response(JSON.stringify({ product: "posthog_code", is_pro: false, code_usage_subscribed: false, burst: { used_percent: 0, resets_in_seconds: 86400, reset_at: "2026-10-16T00:00:00Z", exceeded: false }, sustained: { used_percent: 1, resets_in_seconds: 2592000, reset_at: "2026-11-13T00:00:00Z", exceeded: false }, ai_credits: { exhausted: false, used_usd: null, limit_usd: null }, billing_period_end: "2026-11-13T05:58:42Z" }), { status: 200, headers: { "content-type": "application/json" } })
+  globalThis.fetch = async (url, init = {}) => {
+    const u = String(url)
+    if (u.endsWith("/desktop/gateway_token/")) {
+      mintedAt += 1
+      assert.equal(u, "https://us.posthog.com/api/projects/608221/desktop/gateway_token/")
+      assert.equal(new Headers(init.headers).get("authorization"), "Bearer pha_z")
+      return json(
+        {
+          enabled: true,
+          token: "phe_" + mintedAt,
+          expires_at: new Date(Date.now() + 300e3).toISOString(),
+          gateway_url: "https://ai-gateway.us.posthog.com",
+          plan: "free",
+          allowed_models: ["zai-org/glm-5.2"],
+          product_models: ["zai-org/glm-5.2", "claude-opus-5"],
+        },
+        201,
+      )
+    }
+    if (u.endsWith("/v1/models")) return json({ object: "list", data: gatewayModels, models: gatewayModels })
+    if (u.endsWith("/desktop/usage/")) {
+      return json({
+        product: "posthog_code",
+        burst: { used_percent: 0, resets_in_seconds: 86400, reset_at: "2026-10-26T00:00:00Z", exceeded: false },
+        sustained: { used_percent: 1, resets_in_seconds: 2592000, reset_at: "2026-11-24T00:00:00Z", exceeded: false },
+        ai_credits: { exhausted: false, used_usd: null, limit_usd: null, breakdown: null },
+        is_rate_limited: false,
+        is_pro: false,
+        code_usage_subscribed: false,
+        billing_period_end: "2026-11-13T05:58:42.090000Z",
+      })
+    }
+    if (u.endsWith("/v1/chat/completions")) {
+      sent.push({ url: u, headers: init.headers, body: init.body })
+      if (new Headers(init.headers).get("authorization") !== "Bearer phe_1") {
+        return json({ error: { message: "authentication failed", type: "authentication_error" } }, 401)
+      }
+      return json({ choices: [{ message: { content: "hi" } }] })
+    }
+    throw new Error("unexpected fetch: " + u)
+  }
+
+  // the list is the product's pin, and the credential's pin marks what it may call
+  const live = await hooks.provider.models({ id: "posthog" }, { auth: signed })
+  assert.deepEqual(Object.keys(live).sort(), ["claude-opus-5", "zai-org/glm-5.2"])
+  assert.equal(live["zai-org/glm-5.2"].free, true)
+  assert.equal(live["claude-opus-5"].free, false)
+  assert.equal(live["zai-org/glm-5.2"].api.npm, "@ai-sdk/openai-compatible")
+  assert.equal(live["claude-opus-5"].api.npm, "@ai-sdk/anthropic")
+  assert.equal(mintedAt, 1) // the mint is held, not asked again for the list
+
+  // usage reads the cloud's own endpoint
   const usage = await hooks.auth.usage(async () => signed)
   assert.equal(usage.plan, "Free")
-  assert.deepEqual(usage.windows.map((w) => w.name), ["Sustained", "Code credits"])
-  assert.equal(usage.windows[1].display, "66 / 2000 credits")
+  assert.deepEqual(usage.windows.map((w) => w.name), ["Sustained"])
+  assert.equal(usage.windows[0].used, 1)
+
+  // a request goes through the minted token, whatever the account's bearer is
+  const loader = await hooks.auth.loader(async () => signed)
+  assert.equal(loader.baseURL, "https://ai-gateway.us.posthog.com/v1")
+  const res = await loader.fetch("https://ai-gateway.us.posthog.com/v1/chat/completions", {
+    method: "POST",
+    headers: { Authorization: "Bearer placeholder", "content-type": "application/json" },
+    body: JSON.stringify({ model: "zai-org/glm-5.2", messages: [{ role: "user", content: "hi" }] }),
+  })
+  assert.equal(res.status, 200)
+  assert.equal((await res.json()).choices[0].message.content, "hi")
+  assert.equal(sent.length, 1)
+  assert.equal(new Headers(sent[0].headers).get("authorization"), "Bearer phe_1")
+  assert.equal(new Headers(sent[0].headers).get("x-api-key"), "phe_1")
+  assert.equal(sent[0].url, "https://ai-gateway.us.posthog.com/v1/chat/completions")
+
+  // a 401 from the gateway mints once more and retries the request. The mint is
+  // throttled per account (120 an hour), so the window is aged here rather than
+  // waited out.
+  let rejectOnce = true
+  globalThis.fetch = async (url, init = {}) => {
+    const u = String(url)
+    if (u.endsWith("/v1/chat/completions")) {
+      sent.push({ url: u, headers: init.headers, body: init.body })
+      if (rejectOnce) {
+        rejectOnce = false
+        return json({ error: { message: "authentication failed", type: "authentication_error" } }, 401)
+      }
+      return json({ choices: [{ message: { content: "hi" } }] })
+    }
+    if (u.endsWith("/desktop/gateway_token/")) {
+      mintedAt += 1
+      return json(
+        {
+          token: "phe_" + mintedAt,
+          expires_at: new Date(Date.now() + 300e3).toISOString(),
+          gateway_url: "https://ai-gateway.us.posthog.com",
+          plan: "free",
+          allowed_models: ["zai-org/glm-5.2"],
+          product_models: ["zai-org/glm-5.2", "claude-opus-5"],
+        },
+        201,
+      )
+    }
+    throw new Error("unexpected fetch: " + u)
+  }
+  for (const entry of I.minted.values()) entry.mintedAt = Date.now() - 60_000
+  const retried = await loader.fetch("https://ai-gateway.us.posthog.com/v1/chat/completions", {
+    method: "POST",
+    body: JSON.stringify({ model: "zai-org/glm-5.2" }),
+  })
+  assert.equal(retried.status, 200)
+  assert.equal(mintedAt, 2)
+  assert.equal(new Headers(sent.at(-1).headers).get("authorization"), "Bearer phe_2")
+
+  // a second 401 inside the mint throttle's window is an error to retry, not a
+  // mint loop
+  rejectOnce = true
+  await assert.rejects(
+    loader.fetch("https://ai-gateway.us.posthog.com/v1/chat/completions", {
+      method: "POST",
+      body: JSON.stringify({ model: "zai-org/glm-5.2" }),
+    }),
+    /retry in a few seconds/,
+  )
+
+  // a mint that says no is the account's problem, said with what to do
+  globalThis.fetch = async (url) => {
+    if (String(url).endsWith("/desktop/gateway_token/")) {
+      return json({ enabled: false, reason: "credit_bucket_exhausted", detail: "Your organization has reached its limit" }, 402)
+    }
+    throw new Error("unexpected fetch: " + url)
+  }
+  const fresh = await PostHogAuthPlugin({ client })
+  await assert.rejects(fresh.auth.loader(async () => ({ ...signed, access: "pha_other" })), /credits are used up/)
 } finally {
   globalThis.fetch = realFetch
+  I.minted.clear()
 }
 
 // ---- the hooks, live ---------------------------------------------------------
 if (process.argv.includes("--live")) {
-  const auth = { type: "oauth", access: "pha_expired", refresh: "", region: "us", expires: Date.now() + 3600e3 }
-  const live = await hooks.provider.models({ id: "posthog" }, { auth })
-  assert.equal(Object.keys(live).length, 23, "the gateway's own list")
-  assert.ok(live["claude-opus-5"], "claude-opus-5 is in the plan")
-  assert.equal(live["claude-opus-5"].name, "Claude Opus 5", "the plan's own name")
-  assert.equal(live["zai-org/glm-5.3-flash"].name, "GLM-5.3 Flash")
-  assert.equal(live["claude-opus-5"].api.url, "https://gateway.us.posthog.com/posthog_code/v1")
-  const liveUsage = await hooks.auth.usage(async () => auth)
-  assert.equal(liveUsage.signIn, "expired", "an expired token is what the gateway says")
-  assert.equal(I.FREE_TIER.size, 4)
-  console.log("live: gateway listed", Object.keys(live).length, "models; usage said", liveUsage.error)
+  const { readFileSync } = await import("node:fs")
+  const { homedir } = await import("node:os")
+  const { join } = await import("node:path")
+  // a sign-in magpie already keeps, when there is one
+  let auth = { type: "oauth", access: process.env.POSTHOG_ACCESS ?? "", refresh: "", region: "us", expires: Date.now() + 3600e3 }
+  if (!auth.access) {
+    try {
+      const stored = JSON.parse(readFileSync(join(homedir(), ".config", "magpie", "plugin-auth.json"), "utf8")).posthog
+      if (stored?.access) auth = stored
+    } catch {}
+  }
+  if (!auth.access) {
+    console.log("live: no PostHog sign-in (set POSTHOG_ACCESS, or sign in with magpie first); skipped")
+  } else {
+    const live = await hooks.provider.models({ id: "posthog" }, { auth })
+    assert.ok(Object.keys(live).length > 0, "the plan's list")
+    const glm = live["zai-org/glm-5.2"]
+    assert.ok(glm, "GLM-5.2 is in the plan")
+    assert.equal(glm.api.url, "https://ai-gateway.us.posthog.com/v1")
+    assert.equal(glm.api.npm, "@ai-sdk/openai-compatible")
+    if (live["claude-opus-5"]) assert.equal(live["claude-opus-5"].api.npm, "@ai-sdk/anthropic")
+    const liveUsage = await hooks.auth.usage(async () => auth)
+    assert.equal(liveUsage.signIn, "kept", "a usage read keeps the sign-in")
+    console.log(
+      "live: the plan lists",
+      Object.keys(live).length,
+      "models; usage says",
+      liveUsage.plan,
+      liveUsage.windows.map((w) => `${w.name} ${w.display ?? w.used + "%"}`).join(", "),
+    )
+    // one real chat through the plugin's own fetch, on a free model that answers
+    // text rather than spending the whole budget thinking
+    const free = live["zai-org/glm-5.2"] ?? Object.values(live).find((x) => x.free)
+    if (free) {
+      const loader = await hooks.auth.loader(async () => auth)
+      const res = await loader.fetch(`${loader.baseURL}/chat/completions`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ model: free.id, max_tokens: 64, messages: [{ role: "user", content: "say hi" }] }),
+      })
+      const said = await res.json()
+      assert.equal(res.status, 200, JSON.stringify(said).slice(0, 300))
+      const text = said.choices?.[0]?.message?.content ?? said.choices?.[0]?.message?.reasoning_content ?? ""
+      assert.ok(String(text).length > 0, "the model answered something")
+      console.log("live:", free.id, "answered:", JSON.stringify(String(text).slice(0, 60)))
+    }
+  }
 }
 
 console.log("ok")

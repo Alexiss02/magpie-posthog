@@ -11,6 +11,9 @@ module exports, so `plugin add` here adds all of them.
 magpie plugin add github:Alexiss02/magpie-posthog
 ```
 
+The package is `PostHog` (its `package.json` name, which magpie shows on the
+plugin's row); the provider it signs in to is `posthog`.
+
 Installed from the repository, magpie keeps it current by itself — it compares
 the installed commit with the repository's branch about once an hour and installs
 the newest, the same way it keeps itself up to date. `magpie plugin update` asks
@@ -20,11 +23,15 @@ for it now.
 
 | Plugin | Provider id | What it serves |
 |---|---|---|
-| [posthog](plugins/posthog) | `posthog` | PostHog Desktop's coding plan (PostHog Code) through PostHog's LLM gateway |
+| [posthog](plugins/posthog) | `posthog` | PostHog Desktop's coding plan (PostHog Code) through PostHog's AI gateway |
 
 ```
 magpie plugin login posthog
 ```
+
+The plugin signs in with PostHog Desktop's own OAuth client and mints a short-lived `phe_` gateway
+token per project, which is what PostHog's AI gateway takes — the older
+`gateway.{us,eu}.posthog.com/posthog_code` product is retired.
 
 ## Layout
 
