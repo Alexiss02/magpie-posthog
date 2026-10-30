@@ -153,6 +153,23 @@ assert.deepEqual(I.levelsOf("claude-unnamed-9"), [])
 assert.deepEqual(I.variants(["high"], "@ai-sdk/anthropic"), { high: { effort: "high" } })
 assert.deepEqual(I.variants(["high"], "@ai-sdk/openai-compatible"), { high: { reasoningEffort: "high" } })
 assert.deepEqual(I.variants([], "@ai-sdk/anthropic"), {})
+// every reason PostHog's mint can refuse with carries a hint: the code alone is
+// what desktop_access.py sends for some, credit_state_unknown with no detail at all
+for (const reason of [
+  "oauth_required", "throttled", "email_unverified", "unauthorized", "blocked",
+  "unconfigured", "desktop_access_unavailable", "desktop_access_blocked",
+  "credit_state_unknown", "credit_bucket_exhausted", "mint_failed",
+]) {
+  const said = I.explainedMint({ reason, message: "refused" })
+  assert.ok(said.length > "refused".length, reason + " has no hint: " + said)
+}
+// a prompt past 272k bills at gpt-6.1-sol's long-context rates, which the
+// gateway's flat listing price does not show
+assert.equal(I.costOf("gpt-6.1-sol", { prompt_tokens: 272000, prompt_tokens_details: { cached_tokens: 0 }, completion_tokens: 0 }).toFixed(6), "0.544000")
+assert.equal(I.costOf("gpt-6.1-sol", { prompt_tokens: 272001, prompt_tokens_details: { cached_tokens: 0 }, completion_tokens: 0 }).toFixed(6), "1.088004")
+assert.equal(I.costOf("gpt-6.1-sol", { prompt_tokens: 300000, prompt_tokens_details: { cached_tokens: 0 }, completion_tokens: 1000 }).toFixed(6), "1.215000")
+// and a model with no tier is priced flat however long the prompt
+assert.equal(I.costOf("gpt-5", { prompt_tokens: 1000000, prompt_tokens_details: { cached_tokens: 0 }, completion_tokens: 0 }).toFixed(6), "1.250000")
 
 // ---- the reply limit ----------------------------------------------------------
 // the window is what a prompt and its reply share; Kimi's backend rejects a sum

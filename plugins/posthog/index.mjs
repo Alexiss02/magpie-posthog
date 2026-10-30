@@ -728,6 +728,9 @@ const MINT_HINTS = {
   credit_bucket_exhausted: "the plan's credits are used up; add credits or wait for the period to reset",
   org_deactivated: "this organization is deactivated",
   desktop_access_unavailable: "PostHog couldn't verify Desktop access just now; try again shortly",
+  // raised with no detail of its own when the credit read throws (desktop_access.py
+  // `_disabled("credit_state_unknown")`), so the code alone would reach the user
+  credit_state_unknown: "PostHog couldn't read this project's credit state just now; try again shortly",
   throttled: "too many gateway-token requests; wait a few minutes",
   unconfigured: "PostHog hasn't enabled the AI gateway for this cloud",
   mint_failed: "PostHog couldn't mint a gateway token; try again shortly",
@@ -814,6 +817,15 @@ const PRICES = new Map(
 const remember = (m) =>
   PRICES.set(String(m.id).toLowerCase(), { input: m.input, output: m.output, read: m.read, write: m.write })
 
+// A model can bill a longer prompt at a higher rate once it passes a threshold,
+// and the gateway's listing quotes one flat price for it, so the tier is named
+// here. gpt-6.1-sol is the only exposed one (services/llm-gateway/src/
+// llm_gateway/rate_limiting/model_cost_overrides.py: `*_above_272k_tokens`),
+// and its prices are exactly double on every class but output, which is 1.5x.
+const LONG_CONTEXT = {
+  "gpt-6.1-sol": { over: 272_000, rates: { input: 4e-6, output: 1.5e-5, read: 2e-7, write: 5e-6 } },
+}
+
 // costOf is one reply's cost in dollars, from the usage it reports. Three shapes
 // report it, and they disagree about where the cache sits:
 //
@@ -838,14 +850,16 @@ function costOf(id, u) {
   const besideWritten = Number(u.cache_creation_input_tokens) || 0
   const prompt = Number(u.prompt_tokens ?? u.input_tokens) || 0
   const output = Number(u.completion_tokens ?? u.output_tokens) || 0
+  const tier = LONG_CONTEXT[String(id ?? "").toLowerCase()]
+  const r = tier && prompt > tier.over ? tier.rates : p
   const fresh = Math.max(0, prompt - insideCached - insideWritten)
   // a cache write costs more than a plain prompt token; where the gateway quotes
   // no write price, the prompt's own is the floor
   return (
-    fresh * p.input +
-    (insideCached + besideCached) * p.read +
-    (insideWritten + besideWritten) * (p.write || p.input) +
-    output * p.output
+    fresh * r.input +
+    (insideCached + besideCached) * r.read +
+    (insideWritten + besideWritten) * (r.write || r.input) +
+    output * r.output
   )
 }
 
