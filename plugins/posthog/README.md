@@ -116,7 +116,8 @@ off the gateway rather than copied from Desktop's catalog:
 | GPT-5.4, GPT-5.5, GPT-6 Astra, GPT-6.1 Sol | `low` `medium` `high` `xhigh` |
 | GPT-5.6 Sol / Terra / Luna, GPT-6 Sol, GPT-6 Luna | `none` `low` `medium` `high` `xhigh` |
 | GLM family | `high` `max` |
-| Kimi K3, DeepSeek V4 Flash, DeepSeek V4.1 Flash Fast | none — no effort control |
+| DeepSeek V4.1 Flash Fast | `none` `low` `medium` `high` `xhigh` `max` |
+| Kimi K3, DeepSeek V4 Flash | none — no effort control |
 
 Desktop's catalog offers `max` to every GPT model; the gateway answers `Unsupported value:
 'reasoning_effort' does not support 'max'` for all of them, so it is on no GPT ladder here.

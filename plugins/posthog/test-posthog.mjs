@@ -141,6 +141,10 @@ assert.deepEqual(I.levelsOf("zai-org/glm-5.2"), ["high", "max"])
 // Kimi and DeepSeek reason, but expose no depth to pick
 assert.deepEqual(I.levelsOf("moonshotai/kimi-k3"), [])
 assert.deepEqual(I.levelsOf("deepseek-ai/deepseek-v4-flash-0731"), [])
+// 1017-fast takes the gateway's whole ladder, and "none" really stops it thinking:
+// measured 0 reasoning tokens at "none", 73-145 at low..max. Desktop's catalog lists
+// no effort for it, but that is its picker, not the gateway.
+assert.equal(I.levelsOf("deepseek-ai/deepseek-v4.1-flash-1017-fast").join(","), "none,low,medium,high,xhigh,max")
 // a variant the catalog doesn't name: its family's, else every Codex model's
 assert.equal(I.levelsOf("gpt-5.4").join(","), "low,medium,high,xhigh")
 assert.equal(I.levelsOf("gpt-5.3-codex").join(","), "low,medium,high")

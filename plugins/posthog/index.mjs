@@ -240,6 +240,9 @@ const THROUGH_XHIGH = [...STANDARD, "xhigh"]
 // the GPT-5.6 / GPT-6 Sol / GPT-6 Luna families also take "none", which turns
 // thinking off; gpt-6-astra, gpt-6.1-sol and gpt-5 refuse it
 const NONE_THROUGH_XHIGH = ["none", ...THROUGH_XHIGH]
+// and "none" with the whole ladder: deepseek-v4.1-flash-1017-fast turns
+// thinking off at "none" (0 reasoning tokens, measured) and takes the rest
+const NONE_THROUGH_MAX = ["none", ...THROUGH_MAX]
 const GLM = ["high", "max"]
 
 const EFFORTS = {
@@ -272,7 +275,7 @@ const EFFORTS = {
   "zai-org/glm-5.3-flash": GLM,
   "moonshotai/kimi-k3": [],
   "deepseek-ai/deepseek-v4-flash-0731": [],
-  "deepseek-ai/deepseek-v4.1-flash-1017-fast": [],
+  "deepseek-ai/deepseek-v4.1-flash-1017-fast": NONE_THROUGH_MAX,
 }
 
 // A whole family's depths, for a variant the gateway lists and the catalog
