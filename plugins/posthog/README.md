@@ -56,6 +56,10 @@ Its 201 carries `token`, `expires_at` (300 s by default), `gateway_url`, `plan`
 `credit_bucket_exhausted`, `desktop_access_blocked`, `email_unverified`, `unauthorized`,
 `throttled`, `unconfigured`, `mint_failed` — and each is reported with what to do about it.
 
+`expires_at` is read against the response's `Date` header rather than this machine's clock, as
+Desktop's own `GatewayTokenService` does: a token good for five minutes is short enough that a
+local clock a few minutes off would expire a fresh one, or keep a dead one.
+
 The plugin holds the minted token per project until a tenth of its lifetime is left, mints once
 even when several requests arrive together, and mints again on a 401 from the gateway. It never
 mints twice inside five seconds: the mint is throttled to 120 an hour for the whole account, so a

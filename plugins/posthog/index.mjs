@@ -670,8 +670,13 @@ async function signedIn(client, getAuth) {
 // ---- the gateway token -------------------------------------------------------
 
 // The mint's answer, as this plugin holds it.
-function gatewayToken(region, env) {
-  const expiresAt = Date.parse(env?.expires_at ?? "")
+function gatewayToken(region, env, serverNow) {
+  // Read against the server's clock, as Desktop's GatewayTokenService does: a
+  // local clock minutes off its own would otherwise expire a fresh token, or
+  // keep a dead one. The Date header is what makes a five-minute token safe.
+  const at = Date.parse(env?.expires_at ?? "")
+  const from = Number.isFinite(serverNow) ? serverNow : Date.now()
+  const expiresAt = Number.isFinite(at) ? at - (from - Date.now()) : NaN
   return {
     token: env?.token ?? "",
     gateway: String(env?.gateway_url ?? region.gateway).replace(/\/+$/, "").replace(/\/v1$/, ""),
@@ -692,6 +697,7 @@ const minted = new Map()
 // GatewayTokenService does. Any non-201 is a refusal, and its `reason` says
 // which — the same reasons Desktop's card explains.
 async function mint(region, project, bearer) {
+  const started = Date.now()
   const res = await fetch(mintUrl(region, project), {
     method: "POST",
     headers: { Authorization: `Bearer ${bearer}`, "Content-Type": "application/json", Accept: "application/json" },
@@ -708,7 +714,10 @@ async function mint(region, project, bearer) {
     const why = env.detail || env.error || text.trim().slice(0, 200) || res.statusText
     throw refusal(reason, why, res.status, env.access)
   }
-  return gatewayToken(region, env)
+  // the header names the server's clock; half the round trip puts it at the
+  // answer rather than the request
+  const header = Date.parse(res.headers.get("date") ?? "")
+  return gatewayToken(region, env, Number.isFinite(header) ? header + (Date.now() - started) / 2 : undefined)
 }
 
 // refusal is a mint that said no, carrying what the card can say about it.

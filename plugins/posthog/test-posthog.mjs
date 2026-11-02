@@ -150,6 +150,20 @@ assert.equal(I.levelsOf("gpt-5.4").join(","), "low,medium,high,xhigh")
 assert.equal(I.levelsOf("gpt-5.3-codex").join(","), "low,medium,high")
 // an unnamed Claude model yields none: PostHog never gave it a depth to pick
 assert.deepEqual(I.levelsOf("claude-unnamed-9"), [])
+
+// ---- the mint's expiry is read on the server's clock -------------------------
+// A local clock minutes off would expire a fresh five-minute token, or keep a
+// dead one. gatewayToken folds the Date header in, as Desktop's service does.
+{
+  const fresh = I.gatewayToken(I.REGIONS.us, { token: "phe_x", expires_at: new Date(1793605028793).toISOString(), gateway_url: "https://ai-gateway.us.posthog.com" }, undefined)
+  assert.equal(fresh.expiresAt, 1793605028793)
+  // a header two minutes ahead of this machine pulls the expiry two minutes in
+  const skewed = I.gatewayToken(I.REGIONS.us, { token: "phe_x", expires_at: new Date(1793605028793).toISOString(), gateway_url: "https://ai-gateway.us.posthog.com" }, Date.now() + 120000)
+  assert.equal(skewed.expiresAt, 1793605028793 - 120000)
+  // an unreadable expiry still leaves a usable token
+  const none = I.gatewayToken(I.REGIONS.us, { token: "phe_x", gateway_url: "https://ai-gateway.us.posthog.com" }, undefined)
+  assert.ok(none.expiresAt > Date.now())
+}
 // a level reaches the model under the key its API reads it from: the Messages
 // API takes an effort as output_config.effort (the AI SDK's `effort`), the
 // OpenAI-shaped ones take reasoning_effort (`reasoningEffort`). Filed under the
