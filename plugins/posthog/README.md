@@ -82,6 +82,13 @@ Messages API only, so they are listed as `@ai-sdk/anthropic`; the open-weight an
 answer chat completions, so they are `@ai-sdk/openai-compatible`. A model served on both takes chat
 completions.
 
+**Vision.** The gateway's listing carries no vision flag — Desktop reads `supports_vision` out of
+it and defaults to `false` when it is absent, which today is every model — so the plugin marks
+image input by family: Claude, GPT, Gemini, GLM (`zai-org/glm-*`), DeepSeek (`deepseek-ai/*`) and
+Kimi (`moonshotai/*`). Each family was measured against the real gateway with a 1×1 red PNG; every
+one answered the color, and DeepSeek's `prompt_tokens` rose with the image attached (155 vs 40
+text-only), so the pixels reach the model rather than being dropped.
+
 **Free tier.** A free-plan credential may call exactly four models —
 `zai-org/glm-5.2`, `deepseek-ai/deepseek-v4-flash-0731`, `moonshotai/kimi-k3`,
 `zai-org/glm-5.3-flash` — and those are marked `free` on a free plan, so magpie badges them, and
@@ -210,9 +217,11 @@ scanned as it goes by, its cost taken from the last chunk that carries `usage`.
 
 A gateway refusal never marks the account lapsed, except a 401 from the gateway itself (the
 credential, not the plan, was refused) — the plugin mints once more and retries before saying so.
-The refusals it explains: credits used up, Desktop access not enabled for the project, a model that
-needs a paid plan (naming the free tier), a credential that isn't Desktop's, and the retired
-product.
+When that second mint lands inside the per-user mint throttle, it answers **503** with `retry-after`
+instead of failing the turn: agent SDKs retry a 5xx and give up on a 401, and the refusal clears in
+seconds. The refusals it explains: credits used up, Desktop access not enabled for the project, a
+model that needs a paid plan (naming the free tier), a credential that isn't Desktop's, and the
+retired product.
 
 ## Self-check
 

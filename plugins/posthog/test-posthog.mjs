@@ -107,7 +107,7 @@ assert.equal(m.cost.input, 0.0000014)
 assert.equal(m.cost.cache.read, 0.00000026)
 assert.equal(m.cost.cache.write, 0)
 assert.deepEqual(Object.keys(m.variants), ["high", "max"])
-assert.equal(m.capabilities.attachment, false) // GLM takes no images
+assert.equal(m.capabilities.attachment, true) // GLM takes images: measured, a red PNG came back answered
 assert.equal(m.capabilities.reasoning, true)
 // Claude is served on the Messages API only, so magpie is told to speak that
 const claude = I.fromGateway("claude-opus-5", { context_window: 1000000, api_shapes: ["anthropic-messages"] })
@@ -151,18 +151,31 @@ assert.equal(I.levelsOf("gpt-5.3-codex").join(","), "low,medium,high")
 // an unnamed Claude model yields none: PostHog never gave it a depth to pick
 assert.deepEqual(I.levelsOf("claude-unnamed-9"), [])
 
+// ---- vision: the gateway sends no flag, so it is the family's ---------------
+// Each family here was measured against the real gateway with a 1x1 red PNG.
+for(const id of ["zai-org/glm-5.3-flash","zai-org/glm-5.2","deepseek-ai/deepseek-v4.1-flash-1017-fast","deepseek-ai/deepseek-v4-flash-0731","moonshotai/kimi-k3","claude-sonnet-5","gpt-5"])
+  assert.equal(I.fromGateway(id,{}).vision, true, id)
+
+
 // ---- the mint's expiry is read on the server's clock -------------------------
 // A local clock minutes off would expire a fresh five-minute token, or keep a
 // dead one. gatewayToken folds the Date header in, as Desktop's service does.
 {
-  const fresh = I.gatewayToken(I.REGIONS.us, { token: "phe_x", expires_at: new Date(1793605028793).toISOString(), gateway_url: "https://ai-gateway.us.posthog.com" }, undefined)
-  assert.equal(fresh.expiresAt, 1793605028793)
+  const env = { token: "phe_x", expires_at: new Date(1793605028793).toISOString(), gateway_url: "https://ai-gateway.us.posthog.com" }
+  // a mint with no Date header is taken at its word
+  const plain = () => new Response("", { status: 201 })
+  const at = I.serverExpiry(plain(), Date.now(), env.expires_at)
+  assert.ok(Math.abs(at - 1793605028793) < 1)
   // a header two minutes ahead of this machine pulls the expiry two minutes in
-  const skewed = I.gatewayToken(I.REGIONS.us, { token: "phe_x", expires_at: new Date(1793605028793).toISOString(), gateway_url: "https://ai-gateway.us.posthog.com" }, Date.now() + 120000)
-  assert.equal(skewed.expiresAt, 1793605028793 - 120000)
+  const ahead = () => new Response("", { status: 201, headers: { date: new Date(Date.now() + 120000).toUTCString() } })
+  assert.ok(Math.abs(I.serverExpiry(ahead(), Date.now(), env.expires_at) - (1793605028793 - 120000)) < 1000) // the header is second-granular
+  // half the round trip counts, so a slow answer is not read as a slow server
+  const slow = I.serverExpiry(plain(), Date.now() - 4000, env.expires_at)
+  assert.equal(slow, 1793605028793) // no header, no correction
   // an unreadable expiry still leaves a usable token
-  const none = I.gatewayToken(I.REGIONS.us, { token: "phe_x", gateway_url: "https://ai-gateway.us.posthog.com" }, undefined)
+  const none = I.gatewayToken(I.REGIONS.us, { token: "phe_x", gateway_url: "https://ai-gateway.us.posthog.com" }, NaN)
   assert.ok(none.expiresAt > Date.now())
+  assert.equal(I.gatewayToken(I.REGIONS.us, env, 1793605028793).expiresAt, 1793605028793)
 }
 // a level reaches the model under the key its API reads it from: the Messages
 // API takes an effort as output_config.effort (the AI SDK's `effort`), the
@@ -632,16 +645,18 @@ try {
   assert.equal(mintedAt, 2)
   assert.equal(new Headers(sent.at(-1).headers).get("authorization"), "Bearer phe_2")
 
-  // a second 401 inside the mint throttle's window is an error to retry, not a
-  // mint loop
+  // a second 401 inside the mint throttle's window cannot be replaced yet: 503
+  // with a retry hint, as Desktop's own fallback answers, so the SDK retries
+  // instead of failing the turn on a refusal that clears in seconds
   rejectOnce = true
-  await assert.rejects(
-    loader.fetch("https://ai-gateway.us.posthog.com/v1/chat/completions", {
-      method: "POST",
-      body: JSON.stringify({ model: "zai-org/glm-5.2" }),
-    }),
-    /retry in a few seconds/,
-  )
+  const throttled = await loader.fetch("https://ai-gateway.us.posthog.com/v1/chat/completions", {
+    method: "POST",
+    body: JSON.stringify({ model: "zai-org/glm-5.2" }),
+  })
+  assert.equal(throttled.status, 503)
+  assert.equal(throttled.headers.get("retry-after"), "5")
+  assert.equal(throttled.headers.get("X-Magpie-Sign-In"), "kept")
+  assert.match((await throttled.json()).error.message, /retry in a few seconds/)
 
   // a mint that says no is the account's problem, said with what to do
   globalThis.fetch = async (url) => {

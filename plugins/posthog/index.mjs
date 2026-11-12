@@ -103,8 +103,6 @@ const usageUrl = (r, project) => `${r.cloud}/api/projects/${project}/desktop/usa
 // implicit models and the legacy ids older app builds call. A list the mint
 // doesn't give (a signed-out account) falls back to this.
 const PRODUCT_MODELS = [
-  "claude-haiku-4-5",
-  "claude-sonnet-4-5",
   "@cf/zai-org/glm-5.2",
   "zai-org/glm-5.2",
   "zai-org/glm-5.3",
@@ -112,8 +110,6 @@ const PRODUCT_MODELS = [
   "moonshotai/kimi-k3",
   "deepseek-ai/deepseek-v4-flash-0731",
   "deepseek-ai/deepseek-v4.1-flash-1017-fast",
-  "claude-opus-4-5",
-  "claude-opus-4-6",
   "claude-opus-4-7",
   "claude-opus-4-8",
   "claude-opus-5",
@@ -133,9 +129,6 @@ const PRODUCT_MODELS = [
   "gpt-6.1-sol",
   "gpt-6-luna",
   "gpt-5.4",
-  "gpt-5.3-codex",
-  "gpt-5.2",
-  "gpt-5-mini",
 ]
 
 // What the plan serves without a paid subscription (the gateway's
@@ -245,61 +238,49 @@ const NONE_THROUGH_XHIGH = ["none", ...THROUGH_XHIGH]
 const NONE_THROUGH_MAX = ["none", ...THROUGH_MAX]
 const GLM = ["high", "max"]
 
-const EFFORTS = {
-  "claude-opus-4-5": STANDARD,
-  "claude-opus-4-6": THROUGH_MAX,
-  "claude-opus-4-7": THROUGH_MAX,
-  "claude-opus-4-8": THROUGH_MAX,
-  "claude-opus-5": THROUGH_MAX,
-  "claude-opus-5-5": THROUGH_MAX,
-  "claude-fable-5": THROUGH_MAX,
-  "claude-fable-5-1": THROUGH_MAX,
-  "claude-sonnet-4-6": [...STANDARD, "max"], // no xhigh
-  "claude-sonnet-5": THROUGH_MAX,
-  "claude-sonnet-5-5": THROUGH_MAX,
-  "gpt-5": ["minimal", ...STANDARD],
-  "gpt-5-mini": ["minimal", ...STANDARD],
-  "gpt-5.2": THROUGH_XHIGH,
-  "gpt-5.4": THROUGH_XHIGH,
-  "gpt-5.5": THROUGH_XHIGH,
-  "gpt-5.6-sol": NONE_THROUGH_XHIGH,
-  "gpt-5.6-terra": NONE_THROUGH_XHIGH,
-  "gpt-5.6-luna": NONE_THROUGH_XHIGH,
-  "gpt-6-astra": THROUGH_XHIGH,
-  "gpt-6-sol": NONE_THROUGH_XHIGH,
-  "gpt-6-luna": NONE_THROUGH_XHIGH,
-  "gpt-6.1-sol": THROUGH_XHIGH,
-  "zai-org/glm-5.2": GLM,
-  "@cf/zai-org/glm-5.2": GLM,
-  "zai-org/glm-5.3": GLM,
-  "zai-org/glm-5.3-flash": GLM,
-  "moonshotai/kimi-k3": [],
-  "deepseek-ai/deepseek-v4-flash-0731": [],
-  "deepseek-ai/deepseek-v4.1-flash-1017-fast": NONE_THROUGH_MAX,
-}
-
-// A whole family's depths, for a variant the gateway lists and the catalog
-// doesn't (gpt-5.3-codex): the longest matching prefix wins.
-const FAMILY_EFFORTS = [
+// One table for both an id and its family: [match, levels, exact]. An exact row
+// answers only that id; every other row answers the ids that start with it, the
+// longest one winning. Both passes live in levelsOf, which is why a family row
+// covers a variant the catalog never named (gpt-5.3-codex) while `gpt-5` stays
+// exact — as a prefix it would hand `minimal` to gpt-5.1, which refuses it.
+const LADDERS = [
+  ["gpt-5", ["minimal", ...STANDARD], true],
+  ["gpt-5-mini", ["minimal", ...STANDARD], true],
+  // `gpt-5.2` and up take `xhigh` and refuse `none`; 5.6 and the Sol/Luna
+  // families take `none` too
+  ["gpt-5.2", THROUGH_XHIGH],
+  ["gpt-5.4", THROUGH_XHIGH],
+  ["gpt-5.5", THROUGH_XHIGH],
+  ["gpt-5.6", NONE_THROUGH_XHIGH],
   ["gpt-6-astra", THROUGH_XHIGH],
   ["gpt-6-sol", NONE_THROUGH_XHIGH],
-  ["gpt-6.1-sol", THROUGH_XHIGH],
   ["gpt-6-luna", NONE_THROUGH_XHIGH],
-  ["gpt-5.6", NONE_THROUGH_XHIGH],
-  ["gpt-5.5", THROUGH_XHIGH],
-  ["gpt-5.4", THROUGH_XHIGH],
-  ["gpt-5.2", THROUGH_XHIGH],
+  ["gpt-6.1-sol", THROUGH_XHIGH],
+  // Claude: 4.5 is the odd one out, and Sonnet 4.6 takes `max` without `xhigh`
+  ["claude-opus-4-5", STANDARD, true],
+  ["claude-opus-4", THROUGH_MAX],
+  ["claude-opus-5", THROUGH_MAX],
+  ["claude-fable-5", THROUGH_MAX],
+  ["claude-sonnet-4-6", [...STANDARD, "max"], true],
+  ["claude-sonnet-5", THROUGH_MAX],
+  // GLM takes two depths, not the ladder; the gateway serves 5.2 under two ids
+  ["zai-org/glm", GLM],
+  ["@cf/zai-org/glm", GLM],
+  // the open-weight pairs differ from each other, so neither is a family
+  ["moonshotai/kimi-k3", [], true],
+  ["deepseek-ai/deepseek-v4-flash-0731", [], true],
+  ["deepseek-ai/deepseek-v4.1-flash-1017-fast", NONE_THROUGH_MAX, true],
 ]
 
-// levelsOf is the depths a model takes: its own, its family's, the ones every
-// Codex model has for a gpt-* id neither claims, none otherwise. Claude is
-// absent on purpose — an unnamed Claude model yields no depths, which is what
-// keeps an effort off a model PostHog never gave one.
+// levelsOf is the depths a model takes: its own row, the longest family row
+// that covers it, the ones every Codex model has for a gpt-* id neither claims,
+// none otherwise. Claude is absent on purpose — an unnamed Claude model yields
+// no depths, which is what keeps an effort off a model PostHog never gave one.
 function levelsOf(id) {
-  if (Array.isArray(EFFORTS[id])) return EFFORTS[id]
+  for (const [match, levels, exact] of LADDERS) if (exact && match === id) return levels
   let best = null
-  for (const [prefix, levels] of FAMILY_EFFORTS) {
-    if (id.startsWith(prefix) && (!best || prefix.length > best[0].length)) best = [prefix, levels]
+  for (const [match, levels, exact] of LADDERS) {
+    if (!exact && id.startsWith(match) && (!best || match.length > best[0])) best = [match, levels]
   }
   if (best) return best[1]
   return id.startsWith("gpt-") ? STANDARD : []
@@ -323,8 +304,12 @@ function npmOf(id, shapes) {
 }
 
 // visionOf: the models that take images. The gateway's listing carries no
-// vision flag, so it comes from the family.
-const visionOf = (id) => /^(claude|gpt|gemini)/.test(id)
+// vision flag (75 models, none set it — Desktop defaults it to false too), so
+// it comes from the family. Each family here was measured against the real
+// gateway: a 1x1 red PNG came back answered ("Red") from GLM-5.3-flash, GLM-5.3,
+// GLM-5.2, both DeepSeeks and Kimi, and the image inflated prompt_tokens
+// (155 vs 40 text-only), so the pixels really reached the model.
+const visionOf = (id) => /^(claude|gpt|gemini|zai-org\/glm|deepseek-ai\/|moonshotai\/)/.test(id)
 
 // ---- reply limits ------------------------------------------------------------
 
@@ -669,14 +654,22 @@ async function signedIn(client, getAuth) {
 
 // ---- the gateway token -------------------------------------------------------
 
-// The mint's answer, as this plugin holds it.
-function gatewayToken(region, env, serverNow) {
-  // Read against the server's clock, as Desktop's GatewayTokenService does: a
-  // local clock minutes off its own would otherwise expire a fresh token, or
-  // keep a dead one. The Date header is what makes a five-minute token safe.
-  const at = Date.parse(env?.expires_at ?? "")
-  const from = Number.isFinite(serverNow) ? serverNow : Date.now()
-  const expiresAt = Number.isFinite(at) ? at - (from - Date.now()) : NaN
+// serverExpiry is a mint's `expires_at` in this machine's clock, read against
+// the server's own as Desktop's GatewayTokenService reads it: the Date header,
+// shifted by half the round trip so it names when the answer arrived rather
+// than when the request left. A five-minute token is short enough that a local
+// clock minutes off would expire a fresh one, or keep a dead one.
+function serverExpiry(res, started, expiresAt) {
+  const at = Date.parse(expiresAt ?? "")
+  if (!Number.isFinite(at)) return NaN
+  const header = Date.parse(res.headers.get("date") ?? "")
+  if (!Number.isFinite(header)) return at
+  return at - (header + (Date.now() - started) / 2 - Date.now())
+}
+
+// The mint's answer, as this plugin holds it. `expiresAt` is epoch ms on this
+// machine's clock, or NaN when the mint named none.
+function gatewayToken(region, env, expiresAt) {
   return {
     token: env?.token ?? "",
     gateway: String(env?.gateway_url ?? region.gateway).replace(/\/+$/, "").replace(/\/v1$/, ""),
@@ -714,10 +707,7 @@ async function mint(region, project, bearer) {
     const why = env.detail || env.error || text.trim().slice(0, 200) || res.statusText
     throw refusal(reason, why, res.status, env.access)
   }
-  // the header names the server's clock; half the round trip puts it at the
-  // answer rather than the request
-  const header = Date.parse(res.headers.get("date") ?? "")
-  return gatewayToken(region, env, Number.isFinite(header) ? header + (Date.now() - started) / 2 : undefined)
+  return gatewayToken(region, env, serverExpiry(res, started, env.expires_at))
 }
 
 // refusal is a mint that said no, carrying what the card can say about it.
@@ -764,7 +754,10 @@ async function gatewayFor(s, stale = false) {
   // started, and the token still held answers instead
   if (was?.value && now - was.mintedAt < MINT_MIN_INTERVAL_MS) {
     if (!stale) return was.value
-    throw Object.assign(new Error("PostHog's gateway refused this token and a new one was minted moments ago; retry in a few seconds"), { signIn: "kept" })
+    throw Object.assign(
+      new Error("PostHog's gateway refused this token and a new one was minted moments ago; retry in a few seconds"),
+      { signIn: "kept", throttled: true },
+    )
   }
   const entry = was ?? { value: null, mintedAt: 0, refreshAt: 0, inFlight: null }
   entry.mintedAt = now
@@ -959,7 +952,9 @@ function metered(res, id, add) {
       tail = (tail + dec.decode(chunk, { stream: true })).slice(-8192)
     },
     flush() {
-      read(lastUsage(tail))
+      // drain the decoder's pending bytes, so a stream that ends on a chunk
+      // boundary and one that ends mid-character are closed the same way
+      read(lastUsage(tail + dec.decode()))
     },
   })
   return new Response(res.body.pipeThrough(scan), { status: res.status, statusText: res.statusText, headers: res.headers })
@@ -1188,6 +1183,84 @@ async function explained(res) {
   return new Response(text, { status: res.status, statusText: res.statusText, headers })
 }
 
+// sendTo is one attempt at a model request: the path and query the client asked
+// for, at the gateway the token was minted for, with the minted token under both
+// header names the two APIs read.
+function sendTo(input, init, body, token, host) {
+  const req = input instanceof Request ? input : null
+  const headers = new Headers(init?.headers ?? req?.headers)
+  headers.delete("authorization")
+  headers.delete("x-api-key")
+  // the gateway takes the minted token as either header, and magpie's Anthropic
+  // path sends x-api-key, so both are set
+  headers.set("Authorization", `Bearer ${token}`)
+  headers.set("x-api-key", token)
+  headers.set("Accept", headers.get("Accept") ?? "application/json")
+  // a body a repair rewrote has no content-length that matches it
+  if (typeof body === "string" && body !== init?.body) headers.delete("content-length")
+  const url = new URL(req ? req.url : String(input))
+  return fetch(`${host}${url.pathname}${url.search}`, {
+    ...init,
+    method: init?.method ?? req?.method,
+    headers,
+    body,
+  })
+}
+
+// attempt sends the request, minting again once when the gateway refuses the
+// token, and mending the body past each parameter refusal it names. The gateway's
+// last answer comes back as it is, refusals included.
+//
+// The gateway serves the GPT models on OpenAI's terms: they refuse `max_tokens`,
+// and a temperature other than their one default, and some refuse sampling
+// altogether. The client speaks the shape it was told (chat completions), so the
+// plugin takes those back out of the body before it goes: once per refusal the
+// gateway names, and never for a refusal it cannot mend.
+async function attempt(input, init, s, held) {
+  let gw = await gatewayFor(s)
+  const send = () => sendTo(input, init, held.body, gw.token, gw.gateway)
+  let res = await send()
+  if (res.status === 401) {
+    gw = await gatewayFor(s, true)
+    res = await send()
+  }
+  for (let tries = 0; res.status === 400 && tries < REPAIRS; tries++) {
+    const why = await res.text()
+    const next = repair(held.body, why)
+    if (next === null) {
+      // nothing to take out: the refusal is the answer
+      res = new Response(why, { status: res.status, statusText: res.statusText, headers: res.headers })
+      break
+    }
+    held.body = next
+    res = await send()
+  }
+  return res
+}
+
+// guardCap is the ceiling set on the plugin, checked before every send: the
+// plan's own dollars as last read, plus what this process has spent since. It
+// answers the cap it enforced, or null when none is set.
+async function guardCap(options, s) {
+  const cap = capOf(options)
+  if (cap === null) return null
+  await readUsage(s)
+  const used = usedOf(spent.get(spendKey(s)))
+  if (used >= cap.usd) throw Object.assign(new Error(capped(used, cap)), { signIn: "kept" })
+  return cap
+}
+
+// retryShortly is a request answered 503 with what went wrong, the shape an
+// agent SDK retries: the refused gateway token could not be replaced yet.
+const retryShortly = (e) => {
+  const headers = new Headers({ "content-type": "application/json", "retry-after": "5", "X-Magpie-Sign-In": "kept" })
+  return new Response(JSON.stringify({ error: { message: e?.message ?? String(e), type: "api_error" } }), {
+    status: 503,
+    statusText: "Service Unavailable",
+    headers,
+  })
+}
+
 const kept = (res) => {
   const headers = new Headers(res.headers)
   headers.set("X-Magpie-Sign-In", "kept")
@@ -1289,82 +1362,26 @@ export const PostHogAuthPlugin = async ({ client }, options = {}) => ({
         baseURL: `${gw.gateway}/v1`,
         apiKey: "posthog", // replaced by the minted token on every request below
         async fetch(input, init) {
-          const req = input instanceof Request ? input : null
-          let body = init?.body
-          if (body === undefined && req) body = await req.clone().text()
-          // The gateway serves the GPT models on OpenAI's terms: they refuse
-          // `max_tokens`, and a temperature other than their one default, and
-          // some refuse sampling altogether. The client speaks the shape it was
-          // told (chat completions), so the plugin takes those back out of the
-          // body before it goes: once per refusal the gateway names.
-          const mend = (why) => {
-            const next = repair(body, why)
-            if (next === null) return false
-            body = next
-            return true
-          }
-          const send = async (token, host) => {
-            const headers = new Headers(init?.headers ?? req?.headers)
-            headers.delete("authorization")
-            headers.delete("x-api-key")
-            // the gateway takes the minted token as either header, and magpie's
-            // Anthropic path sends x-api-key, so both are set
-            headers.set("Authorization", `Bearer ${token}`)
-            headers.set("x-api-key", token)
-            headers.set("Accept", headers.get("Accept") ?? "application/json")
-            if (typeof body === "string" && body !== init?.body) headers.delete("content-length")
-            const url = new URL(req ? req.url : String(input))
-            // the gateway the token was minted for: the request keeps its path
-            // (/v1/chat/completions, /v1/messages), at that host
-            return fetch(`${host}${url.pathname}${url.search}`, {
-              ...init,
-              method: init?.method ?? req?.method,
-              headers,
-              body,
-            })
-          }
-          let s = await signedIn(client, getAuth)
+          // the body is rewritten by a repair, so it is held rather than copied
+          const held = { body: init?.body }
+          if (held.body === undefined && input instanceof Request) held.body = await input.clone().text()
+          const s = await signedIn(client, getAuth)
           if (!s) throw Object.assign(new Error("PostHog isn't signed in"), { signIn: "expired" })
-          let gw
+          const cap = await guardCap(options, s)
+          const model = modelIn(held.body)
+          let out
           try {
-            gw = await gatewayFor(s)
+            out = await attempt(input, init, s, held)
           } catch (e) {
+            // a mint inside the throttle window cannot replace a refused token
+            // yet: Desktop answers 503 here, not 401, because agent SDKs retry a
+            // 5xx and give up on a 401, and the refusal clears in seconds
+            if (e?.throttled) return retryShortly(e)
             throw Object.assign(new Error(explainedMint(e)), { signIn: e?.signIn ?? "kept" })
           }
-          // the ceiling set on the plugin, checked before every send: the plan's
-          // own dollars as last read, plus what this process has spent since
-          const cap = capOf(options)
-          const key = spendKey(s)
-          if (cap !== null) {
-            await readUsage(s)
-            const used = usedOf(spent.get(key))
-            if (used >= cap.usd) throw Object.assign(new Error(capped(used, cap)), { signIn: "kept" })
-          }
-          const model = modelIn(body)
-          let res = await send(gw.token, gw.gateway)
-          if (res.status === 401) {
-            // a token past its end (or one the gateway dropped): mint again, once
-            try {
-              gw = await gatewayFor(s, true)
-              res = await send(gw.token, gw.gateway)
-            } catch (e) {
-              throw Object.assign(new Error(explainedMint(e)), { signIn: e?.signIn ?? "kept" })
-            }
-          }
-          // a parameter the model refuses: take it out and ask again. Bounded,
-          // and only for a body the gateway itself named a parameter in, so a
-          // real refusal is never sent twice
-          for (let tries = 0; res.status === 400 && tries < REPAIRS; tries++) {
-            const why = await res.text()
-            if (!mend(why)) {
-              res = new Response(why, { status: res.status, statusText: res.statusText, headers: res.headers })
-              break
-            }
-            res = await send(gw.token, gw.gateway)
-          }
-          if (res.status >= 400) return explained(res)
+          if (out.status >= 400) return explained(out)
           // what it cost, added to the meter as it goes by
-          return kept(cap === null ? res : metered(res, model, (usd) => spentOn(key, usd)))
+          return kept(cap === null ? out : metered(out, model, (usd) => spentOn(spendKey(s), usd)))
         },
       }
     },
@@ -1472,6 +1489,7 @@ export const _internal = {
   bearerOf,
   signedIn,
   gatewayToken,
+  serverExpiry,
   gatewayFor,
   mint,
   minted,
